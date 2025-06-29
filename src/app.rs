@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, time::Duration};
 
+use bytesize::ByteSize;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal,
@@ -156,6 +157,12 @@ impl Widget for &mut App {
                 Row::new([
                     Cell::new(pid.to_string()),
                     Cell::new(format!("{}%", process.cpu_usage)),
+                    Cell::new(
+                        ByteSize::b(process.memory_usage)
+                            .display()
+                            .iec()
+                            .to_string(),
+                    ),
                     Cell::new(process.name.to_string_lossy()),
                 ])
             })
@@ -163,6 +170,7 @@ impl Widget for &mut App {
         let table = Table::new(
             rows,
             [
+                Constraint::Min(20),
                 Constraint::Min(20),
                 Constraint::Min(20),
                 Constraint::Min(20),
