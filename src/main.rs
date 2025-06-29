@@ -30,6 +30,7 @@ static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let writer = std::fs::OpenOptions::new()
+        .create(true)
         .write(true)
         .append(true)
         .open(LOG_PATH.as_path())?;
@@ -41,7 +42,7 @@ fn main() -> color_eyre::Result<()> {
     tracing::info!("jo started");
 
     let mut terminal = ratatui::init();
-    let app_result = App::default().run(&mut terminal);
+    let app_result = smol::block_on(App::default().run(&mut terminal));
 
     ratatui::restore();
     app_result

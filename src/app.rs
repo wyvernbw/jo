@@ -1,14 +1,16 @@
-use std::{borrow::Cow, collections::HashMap, time::Duration};
+use std::{cmp::Ordering, time::Duration};
 
-use color_eyre::eyre::eyre;
-use flume::{Receiver, Sender};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     prelude::*,
-    widgets::{Cell, Paragraph, Row, Table, TableState},
+    widgets::{Cell, Row, Table, TableState},
 };
-use sysinfo::{Pid, Process, System};
+use smol::{
+    channel::{Receiver, Sender},
+    stream::StreamExt,
+};
+use sysinfo::{CpuRefreshKind, Pid, System};
 
 use crate::process::ProcessData;
 
@@ -24,16 +26,39 @@ struct SystemInformation {
     processes: Vec<(Pid, ProcessData)>,
 }
 
+#[derive(Debug)]
+enum LoopEvent {
+    Input(Command),
+    SysInfo,
+}
+
+#[derive(Debug)]
+enum Command {
+    Quit,
+}
+
 impl App {
     /// runs the application's main loop until the user quits
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
-        let (tx, rx) = flume::bounded(32);
-        std::thread::spawn(|| Self::sysinfo_thread(tx));
+    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
+        let (tx, rx) = smol::channel::bounded(32);
+        let _sysinfo_thread = smol::spawn(Self::sysinfo_thread(tx));
+        let mut stream = crossterm::event::EventStream::new();
         while !self.exit {
-            self.receive_system_information(&rx)?;
             terminal.draw(|frame| self.draw(frame))?;
-            self.handle_events()?;
+            let sys_info_event = self.receive_system_information(&rx);
+            let input_event = Self::get_input_event(&mut stream);
+            let event = smol::future::race(sys_info_event, input_event).await;
+            tracing::info!(?event);
+            match event? {
+                LoopEvent::Input(command) => {
+                    if let Err(err) = self.handle_command(command) {
+                        tracing::warn!(%err);
+                    }
+                }
+                LoopEvent::SysInfo => continue,
+            };
         }
+        tracing::info!("jo event loop closed");
         Ok(())
     }
 
@@ -41,60 +66,80 @@ impl App {
         frame.render_widget(self, frame.area());
     }
 
-    fn handle_events(&mut self) -> color_eyre::Result<()> {
-        if !event::poll(Duration::from_millis(50))? {
-            return Ok(());
+    async fn get_input_event(stream: &mut EventStream) -> color_eyre::Result<LoopEvent> {
+        loop {
+            if let Some(Ok(input_event)) = stream.next().await {
+                match input_event {
+                    // it's important to check that the event is a key press event as
+                    // crossterm also emits key release and repeat events on Windows.
+                    Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                        if let Some(command) = Self::map_key_to_command(&key_event) {
+                            return Ok(LoopEvent::Input(command));
+                        }
+                    }
+                    _ => {}
+                };
+            };
         }
-        match event::read()? {
-            // it's important to check that the event is a key press event as
-            // crossterm also emits key release and repeat events on Windows.
-            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                self.handle_key_event(&key_event)?;
+    }
+
+    fn handle_command(&mut self, command: Command) -> color_eyre::Result<()> {
+        match command {
+            Command::Quit => {
+                self.exit = true;
+                tracing::info!("jo quitting");
             }
-            _ => {}
         };
         Ok(())
     }
 
-    fn handle_key_event(&mut self, key_event: &KeyEvent) -> color_eyre::Result<()> {
+    fn map_key_to_command(key_event: &KeyEvent) -> Option<Command> {
         match key_event {
             KeyEvent {
                 code: KeyCode::Char('q'),
                 ..
-            } => self.exit = true,
+            } => {
+                return Some(Command::Quit);
+            }
             _ => {}
         };
-        Ok(())
+        None
     }
 
-    fn sysinfo_thread(tx: Sender<SystemInformation>) -> color_eyre::Result<()> {
+    async fn sysinfo_thread(tx: Sender<SystemInformation>) -> color_eyre::Result<()> {
         let mut system = System::new();
+        system.refresh_cpu_list(CpuRefreshKind::default());
+        let cpu_count = system.cpus().len();
         loop {
             system.refresh_all();
             let mut processes = system
                 .processes()
                 .iter()
-                .map(|(pid, process)| (pid.clone(), process.into()))
+                .map(|(pid, process)| {
+                    (
+                        pid.clone(),
+                        ProcessData::from_process(process, cpu_count as u16),
+                    )
+                })
                 .collect::<Vec<(Pid, ProcessData)>>();
-            processes.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
+            processes.sort_by(|(_, a), (_, b)| {
+                b.cpu_usage
+                    .partial_cmp(&a.cpu_usage)
+                    .unwrap_or(Ordering::Equal)
+            });
             let processes = processes.into_iter().collect();
-            tx.send(SystemInformation { processes })?;
-            std::thread::sleep(Duration::from_millis(500));
+            tx.send(SystemInformation { processes }).await?;
+            smol::Timer::after(Duration::from_millis(1000)).await;
         }
     }
 
-    fn receive_system_information(
+    async fn receive_system_information(
         &mut self,
         rx: &Receiver<SystemInformation>,
-    ) -> color_eyre::Result<()> {
-        match rx.try_recv() {
-            Ok(res) => {
-                self.system_information = res;
-                Ok(())
-            }
-            Err(flume::TryRecvError::Empty) => Ok(()),
-            _ => Err(eyre!("system information receiver disconnected.")),
-        }
+    ) -> color_eyre::Result<LoopEvent> {
+        let res = rx.recv().await?;
+        self.system_information = res;
+        Ok(LoopEvent::SysInfo)
     }
 }
 
@@ -110,11 +155,19 @@ impl Widget for &mut App {
             .map(|(pid, process)| {
                 Row::new([
                     Cell::new(pid.to_string()),
+                    Cell::new(format!("{}%", process.cpu_usage)),
                     Cell::new(process.name.to_string_lossy()),
                 ])
             })
             .collect::<Vec<_>>();
-        let table = Table::new(rows, [Constraint::Min(20), Constraint::Min(20)]);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Min(20),
+                Constraint::Min(20),
+                Constraint::Min(20),
+            ],
+        );
         StatefulWidget::render(table, area, buf, &mut self.table_state);
     }
 }

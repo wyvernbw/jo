@@ -2,14 +2,16 @@ use std::ffi::OsString;
 
 use sysinfo::Process;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProcessData {
     pub name: OsString,
+    pub cpu_usage: f32,
 }
 
-impl From<&Process> for ProcessData {
-    fn from(value: &Process) -> Self {
+impl ProcessData {
+    pub fn from_process(value: &Process, cpu_count: u16) -> Self {
         let name = value.name().to_os_string();
-        ProcessData { name }
+        let cpu_usage = value.cpu_usage() / f32::from(cpu_count);
+        ProcessData { name, cpu_usage }
     }
 }
