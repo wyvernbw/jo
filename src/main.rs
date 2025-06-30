@@ -8,6 +8,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::app::App;
@@ -35,6 +36,7 @@ fn main() -> color_eyre::Result<()> {
         .append(true)
         .open(LOG_PATH.as_path())?;
     tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::DEBUG)
         .with_writer(Mutex::new(writer))
         .with_ansi(false)
         .finish()

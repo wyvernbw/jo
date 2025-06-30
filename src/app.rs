@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, time::Duration};
+use std::{cmp::Ordering, fmt::Display, time::Duration};
 
 use bytesize::ByteSize;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
@@ -131,7 +131,7 @@ impl App {
                 .cpu_count(cpu_count)
                 .call()?;
             tx.send(SystemInformation { processes: ptree }).await?;
-            smol::Timer::after(Duration::from_millis(1000)).await;
+            smol::Timer::after(Duration::from_millis(2000)).await;
         }
     }
 
@@ -145,31 +145,77 @@ impl App {
     }
 }
 
+enum TreePrefix {
+    FirstChild,
+    MiddleChild,
+    LastChild,
+}
+
+impl Display for TreePrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let res = match self {
+            TreePrefix::FirstChild => "",
+            TreePrefix::MiddleChild => " ├─",
+            TreePrefix::LastChild => " └─",
+        };
+        write!(f, "{}", res)
+    }
+}
+
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer)
     where
         Self: Sized,
     {
-        let Some(ref system_information) = self.system_information else {
+        let Some(system_information) = &mut self.system_information else {
             tracing::warn!("no system information");
             return;
         };
-        let rows = system_information
-            .processes
+        let processes = &mut system_information.processes;
+        processes.deep_sort_by(|a, b| match (a.value(), b.value()) {
+            (ProcessNode::Root, ProcessNode::Root) => unreachable!("only one root for the tree"),
+            (ProcessNode::Root, ProcessNode::Process(_)) => Ordering::Less,
+            (ProcessNode::Process(_), ProcessNode::Root) => Ordering::Greater,
+            (ProcessNode::Process(a), ProcessNode::Process(b)) => {
+                b.cpu_usage.total_cmp(&a.cpu_usage)
+            }
+        });
+        let mut depth = 0usize;
+        let rows = processes
             .0
             .root()
             .traverse()
             .flat_map(|edge| match edge {
-                ego_tree::iter::Edge::Open(node_ref) => Some(node_ref),
-                ego_tree::iter::Edge::Close(_) => None,
+                ego_tree::iter::Edge::Open(node_ref) => {
+                    depth += 1;
+                    if depth <= 2 {
+                        return Some((depth, TreePrefix::FirstChild, node_ref));
+                    }
+                    if node_ref.next_sibling().is_none() {
+                        return Some((depth, TreePrefix::LastChild, node_ref));
+                    }
+                    Some((depth, TreePrefix::MiddleChild, node_ref))
+                }
+                ego_tree::iter::Edge::Close(_) => {
+                    depth -= 1;
+                    None
+                }
             })
-            .skip_placeholder_root()
-            .map(|proc| {
+            .flat_map(|(depth, prefix, node)| match node.value() {
+                ProcessNode::Root => None,
+                ProcessNode::Process(proc) => Some((depth, prefix, proc)),
+            })
+            .map(|(depth, prefix, proc)| {
                 Row::new([
                     Cell::new(proc.pid.to_string()),
                     Cell::new(format!("{}%", proc.cpu_usage)),
                     Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string()),
-                    Cell::new(proc.name.to_string_lossy()),
+                    Cell::new(format!(
+                        "{}{} {}",
+                        " │ ".repeat(depth.saturating_sub(2)),
+                        prefix,
+                        proc.name.display()
+                    )),
                 ])
             })
             .collect::<Vec<_>>();

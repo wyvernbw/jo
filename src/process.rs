@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::OsString};
+use std::{cmp::Ordering, collections::HashMap, ffi::OsString};
 
 use bon::builder;
 use color_eyre::eyre::eyre;
@@ -35,6 +35,24 @@ pub enum ProcessNode {
     Process(ProcessData),
 }
 
+impl ProcessNode {
+    /// Returns `true` if the process node is [`Root`].
+    ///
+    /// [`Root`]: ProcessNode::Root
+    #[must_use]
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+
+    /// Returns `true` if the process node is [`Process`].
+    ///
+    /// [`Process`]: ProcessNode::Process
+    #[must_use]
+    pub fn is_process(&self) -> bool {
+        matches!(self, Self::Process(..))
+    }
+}
+
 #[derive(Debug)]
 pub struct ProcessTree(pub Tree<ProcessNode>);
 
@@ -48,14 +66,23 @@ impl ProcessTree {
         let mut tree = Tree::new(ProcessNode::Root);
         let mut tree_map = HashMap::<Pid, NodeId>::default();
         proc.iter()
-            // .filter(|&(_, process)| process.parent().is_none())
+            .filter(|&(_, process)| process.parent().is_none())
             .map(|(pid, process)| (pid, ProcessData::from_process(process, cpu_count)))
             .for_each(|(&pid, data)| {
                 let node = tree.root_mut().append(ProcessNode::Process(data)).id();
                 tree_map.insert(pid, node);
                 stack.push(pid);
             });
+        tracing::info!(
+            "root processes: {:?}",
+            tree.root()
+                .children()
+                .skip_placeholder_root()
+                .map(|node| node.name.display())
+                .collect::<Vec<_>>()
+        );
 
+        tracing::info!(initial_tree_map = ?tree_map);
         while let Some(value) = stack.pop() {
             stack.extend(
                 proc.iter()
@@ -69,16 +96,41 @@ impl ProcessTree {
             let Some(parent_pid) = process.parent() else {
                 continue;
             };
+            tracing::debug!(?parent_pid, "fetching from tree map");
             let parent_id = tree_map
                 .get(&parent_pid)
                 .ok_or(eyre!("pid not in tree map"))?;
             let process_data = ProcessData::from_process(process, cpu_count);
-            tree.get_mut(*parent_id)
+            let id = tree
+                .get_mut(*parent_id)
                 .ok_or(eyre!("parent not in tree"))?
-                .append(ProcessNode::Process(process_data));
+                .append(ProcessNode::Process(process_data))
+                .id();
+            tree_map.insert(process.pid(), id);
         }
 
         Ok(ProcessTree(tree))
+    }
+
+    pub fn deep_sort_by(
+        &mut self,
+        f: impl Fn(NodeRef<'_, ProcessNode>, NodeRef<'_, ProcessNode>) -> Ordering,
+    ) {
+        let mut stack = vec![];
+        stack.reserve(self.0.values().len());
+        stack.push(self.0.root().id());
+        while let Some(node_id) = stack.pop() {
+            let mut node = self
+                .0
+                .get_mut(node_id)
+                .expect("created a node id out of thin air. i truly am magical.");
+            node.sort_by(&f);
+            let node = self
+                .0
+                .get(node_id)
+                .expect("created a node id out of thin air. i truly am magical.");
+            stack.extend(node.children().map(|child| child.id()))
+        }
     }
 }
 
