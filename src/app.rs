@@ -13,18 +13,23 @@ use smol::{
 };
 use sysinfo::{CpuRefreshKind, Pid, System};
 
-use crate::process::ProcessData;
+use crate::process::{ProcessData, ProcessNode, ProcessTree, SkipPlaceholderRoot};
 
 #[derive(Debug, Default)]
 pub struct App {
     exit: bool,
-    system_information: SystemInformation,
+    system_information: Option<SystemInformation>,
     table_state: TableState,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct ProcessBundle {
+    data: ProcessData,
+}
+
+#[derive(Debug)]
 struct SystemInformation {
-    processes: Vec<(Pid, ProcessData)>,
+    processes: ProcessTree,
 }
 
 #[derive(Debug)]
@@ -42,10 +47,16 @@ impl App {
     /// runs the application's main loop until the user quits
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let (tx, rx) = smol::channel::bounded(32);
-        let _sysinfo_thread = smol::spawn(Self::sysinfo_thread(tx));
+        smol::spawn(async {
+            let res = Self::sysinfo_task(tx).await;
+            match res {
+                Ok(_) => tracing::info!("sysinfo task finished"),
+                Err(err) => tracing::error!(?err, "sysinfo task died"),
+            }
+        })
+        .detach();
         let mut stream = crossterm::event::EventStream::new();
         while !self.exit {
-            terminal.draw(|frame| self.draw(frame))?;
             let sys_info_event = self.receive_system_information(&rx);
             let input_event = Self::get_input_event(&mut stream);
             let event = smol::future::race(sys_info_event, input_event).await;
@@ -56,8 +67,9 @@ impl App {
                         tracing::warn!(%err);
                     }
                 }
-                LoopEvent::SysInfo => continue,
+                LoopEvent::SysInfo => {}
             };
+            terminal.draw(|frame| self.draw(frame))?;
         }
         tracing::info!("jo event loop closed");
         Ok(())
@@ -107,29 +119,18 @@ impl App {
         None
     }
 
-    async fn sysinfo_thread(tx: Sender<SystemInformation>) -> color_eyre::Result<()> {
+    async fn sysinfo_task(tx: Sender<SystemInformation>) -> color_eyre::Result<()> {
         let mut system = System::new();
         system.refresh_cpu_list(CpuRefreshKind::default());
         let cpu_count = system.cpus().len();
         loop {
             system.refresh_all();
-            let mut processes = system
-                .processes()
-                .iter()
-                .map(|(pid, process)| {
-                    (
-                        pid.clone(),
-                        ProcessData::from_process(process, cpu_count as u16),
-                    )
-                })
-                .collect::<Vec<(Pid, ProcessData)>>();
-            processes.sort_by(|(_, a), (_, b)| {
-                b.cpu_usage
-                    .partial_cmp(&a.cpu_usage)
-                    .unwrap_or(Ordering::Equal)
-            });
-            let processes = processes.into_iter().collect();
-            tx.send(SystemInformation { processes }).await?;
+            let processes = system.processes();
+            let ptree = ProcessTree::try_new()
+                .proc(processes)
+                .cpu_count(cpu_count)
+                .call()?;
+            tx.send(SystemInformation { processes: ptree }).await?;
             smol::Timer::after(Duration::from_millis(1000)).await;
         }
     }
@@ -139,7 +140,7 @@ impl App {
         rx: &Receiver<SystemInformation>,
     ) -> color_eyre::Result<LoopEvent> {
         let res = rx.recv().await?;
-        self.system_information = res;
+        self.system_information = Some(res);
         Ok(LoopEvent::SysInfo)
     }
 }
@@ -149,21 +150,26 @@ impl Widget for &mut App {
     where
         Self: Sized,
     {
-        let rows = self
-            .system_information
+        let Some(ref system_information) = self.system_information else {
+            tracing::warn!("no system information");
+            return;
+        };
+        let rows = system_information
             .processes
-            .iter()
-            .map(|(pid, process)| {
+            .0
+            .root()
+            .traverse()
+            .flat_map(|edge| match edge {
+                ego_tree::iter::Edge::Open(node_ref) => Some(node_ref),
+                ego_tree::iter::Edge::Close(_) => None,
+            })
+            .skip_placeholder_root()
+            .map(|proc| {
                 Row::new([
-                    Cell::new(pid.to_string()),
-                    Cell::new(format!("{}%", process.cpu_usage)),
-                    Cell::new(
-                        ByteSize::b(process.memory_usage)
-                            .display()
-                            .iec()
-                            .to_string(),
-                    ),
-                    Cell::new(process.name.to_string_lossy()),
+                    Cell::new(proc.pid.to_string()),
+                    Cell::new(format!("{}%", proc.cpu_usage)),
+                    Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string()),
+                    Cell::new(proc.name.to_string_lossy()),
                 ])
             })
             .collect::<Vec<_>>();
