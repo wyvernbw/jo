@@ -2,11 +2,9 @@ use std::{borrow::Cow, cmp::Ordering, fmt::Display, ops::Index, time::Duration};
 
 use bytesize::ByteSize;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
-use ego_tree::NodeRef;
 use ratatui::{
     DefaultTerminal,
     prelude::*,
-    style::Styled,
     widgets::{Block, Cell, Paragraph, Row, Table, TableState},
 };
 use smol::{
@@ -34,6 +32,7 @@ enum Mode {
     #[default]
     Normal,
     Go,
+    Search(String),
 }
 
 impl Display for Mode {
@@ -41,6 +40,7 @@ impl Display for Mode {
         match self {
             Mode::Normal => write!(f, "NORM"),
             Mode::Go => write!(f, "GO"),
+            Mode::Search(_) => write!(f, "SEARCH"),
         }
     }
 }
@@ -61,6 +61,9 @@ enum Command {
     Quit,
     Down,
     Up,
+    Search,
+    Go,
+    Cancel,
 }
 
 enum TreeData<'a> {
@@ -83,7 +86,9 @@ impl App {
     /// runs the application's main loop until the user quits
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let input_channel = smol::channel::bounded(2);
-        smol::spawn(Self::input_task(input_channel.0)).detach();
+        let mode_channel = smol::channel::bounded(2);
+        mode_channel.0.send(self.mode.clone()).await?;
+        smol::spawn(Self::input_task(input_channel.0, mode_channel.1)).detach();
         self.fetch_system_information()?;
         self.table_state.select_first();
         let mut duration = Duration::from_millis(1500);
@@ -105,6 +110,7 @@ impl App {
                         tracing::warn!(%err);
                     }
                     duration = Duration::from_millis(500);
+                    mode_channel.0.send(self.mode.clone()).await?;
                 }
                 LoopEvent::SysInfo => {
                     self.fetch_system_information()?;
@@ -133,23 +139,27 @@ impl App {
         Ok(())
     }
 
-    async fn input_task(tx: Sender<LoopEvent>) -> color_eyre::Result<()> {
+    async fn input_task(tx: Sender<LoopEvent>, rx: Receiver<Mode>) -> color_eyre::Result<()> {
         let mut stream = crossterm::event::EventStream::new();
         loop {
-            if let Ok(res) = Self::get_input_event(&mut stream).await {
+            let mode = rx.recv().await?;
+            if let Ok(res) = Self::get_input_event(&mut stream, mode).await {
                 tx.send(res).await?;
             };
         }
     }
 
-    async fn get_input_event(stream: &mut EventStream) -> color_eyre::Result<LoopEvent> {
+    async fn get_input_event(
+        stream: &mut EventStream,
+        current_mode: Mode,
+    ) -> color_eyre::Result<LoopEvent> {
         loop {
             if let Some(Ok(input_event)) = stream.next().await {
                 match input_event {
                     // it's important to check that the event is a key press event as
                     // crossterm also emits key release and repeat events on Windows.
                     Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                        if let Some(command) = Self::map_key_to_command(&key_event) {
+                        if let Some(command) = Self::map_key_to_command(&key_event, &current_mode) {
                             return Ok(LoopEvent::Input(command));
                         }
                     }
@@ -160,35 +170,88 @@ impl App {
     }
 
     fn handle_command(&mut self, command: Command) -> color_eyre::Result<()> {
-        match command {
-            Command::Quit => {
+        match (&self.mode, command) {
+            (Mode::Normal, Command::Quit) => {
                 self.exit = true;
                 tracing::info!("jo quitting");
             }
-            Command::Down => {
+            (Mode::Normal | Mode::Go, Command::Down) => {
                 self.table_state.scroll_down_by(1);
             }
-            Command::Up => self.table_state.scroll_up_by(1),
+            (Mode::Normal | Mode::Go, Command::Up) => {
+                self.table_state.scroll_up_by(1);
+                self.mode = Mode::Normal;
+            }
+            (Mode::Normal, Command::Search) => {
+                self.mode = Mode::Search("".to_string());
+            }
+            (Mode::Normal, Command::Go) => {
+                self.mode = Mode::Go;
+            }
+            (Mode::Normal, Command::Cancel) => {}
+            (Mode::Go, Command::Quit) => {}
+            (Mode::Go, Command::Search) => {}
+            (Mode::Go, Command::Cancel) => {
+                self.mode = Mode::Normal;
+            }
+            (Mode::Go, Command::Go) => unreachable!(),
+            (Mode::Search(_), Command::Quit) => unreachable!(),
+            (Mode::Search(_), Command::Down) => unreachable!(),
+            (Mode::Search(_), Command::Up) => unreachable!(),
+            (Mode::Search(_), Command::Search) => unreachable!(),
+            (Mode::Search(_), Command::Cancel) => {
+                self.mode = Mode::Normal;
+            }
+            (Mode::Search(_), Command::Go) => unreachable!(),
         };
         Ok(())
     }
 
-    fn map_key_to_command(key_event: &KeyEvent) -> Option<Command> {
-        match key_event {
-            KeyEvent {
-                code: KeyCode::Char('q'),
-                ..
-            } => {
+    fn map_key_to_command(key_event: &KeyEvent, current_mode: &Mode) -> Option<Command> {
+        match (current_mode, key_event) {
+            (
+                Mode::Normal,
+                KeyEvent {
+                    code: KeyCode::Char('q'),
+                    ..
+                },
+            ) => {
                 return Some(Command::Quit);
             }
-            KeyEvent {
-                code: KeyCode::Char('j') | KeyCode::Down,
-                ..
-            } => return Some(Command::Down),
-            KeyEvent {
-                code: KeyCode::Char('k') | KeyCode::Up,
-                ..
-            } => return Some(Command::Up),
+            (
+                Mode::Normal | Mode::Go,
+                KeyEvent {
+                    code: KeyCode::Char('j') | KeyCode::Down,
+                    ..
+                },
+            ) => return Some(Command::Down),
+            (
+                Mode::Normal | Mode::Go,
+                KeyEvent {
+                    code: KeyCode::Char('k') | KeyCode::Up,
+                    ..
+                },
+            ) => return Some(Command::Up),
+            (
+                Mode::Normal,
+                KeyEvent {
+                    code: KeyCode::Char('/'),
+                    ..
+                },
+            ) => return Some(Command::Search),
+            (
+                Mode::Search(_) | Mode::Go,
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                },
+            ) => return Some(Command::Cancel),
+            (
+                Mode::Normal,
+                KeyEvent {
+                    code: KeyCode::Char('g'),
+                    ..
+                },
+            ) => return Some(Command::Go),
             _ => {}
         };
         None
