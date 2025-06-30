@@ -10,21 +10,31 @@ pub struct ProcessData {
     pub name: OsString,
     pub pid: Pid,
     pub cpu_usage: f32,
+    pub memory_percent: f32,
     pub memory_usage: u64,
 }
 
 impl ProcessData {
-    pub fn from_process(value: &Process, cpu_count: usize) -> Self {
-        let name = value.name().to_os_string();
+    pub fn from_process(value: &Process, cpu_count: usize, memory: u64) -> Self {
+        let name = match value.exe() {
+            Some(exe) => exe.as_os_str().to_os_string(),
+            None => value.name().to_os_string(),
+        };
         let cpu_usage = value.cpu_usage() as f64 / (cpu_count as f64);
         let cpu_usage = cpu_usage as f32;
         let memory_usage = value.memory();
+        let memory_percent = {
+            let memory_percent = (memory_usage as f64) / (memory as f64);
+            let memory_percent = memory_percent * 100.0;
+            memory_percent as f32
+        };
         let pid = value.pid();
         ProcessData {
             pid,
             name,
             cpu_usage,
             memory_usage,
+            memory_percent,
         }
     }
 }
@@ -59,7 +69,11 @@ pub struct ProcessTree(pub Tree<ProcessNode>);
 #[bon::bon]
 impl ProcessTree {
     #[builder]
-    pub fn try_new(proc: &HashMap<Pid, Process>, cpu_count: usize) -> color_eyre::Result<Self> {
+    pub fn try_new(
+        proc: &HashMap<Pid, Process>,
+        cpu_count: usize,
+        memory: u64,
+    ) -> color_eyre::Result<Self> {
         let mut stack = vec![];
         stack.reserve(proc.len());
 
@@ -67,7 +81,7 @@ impl ProcessTree {
         let mut tree_map = HashMap::<Pid, NodeId>::default();
         proc.iter()
             .filter(|&(_, process)| process.parent().is_none())
-            .map(|(pid, process)| (pid, ProcessData::from_process(process, cpu_count)))
+            .map(|(pid, process)| (pid, ProcessData::from_process(process, cpu_count, memory)))
             .for_each(|(&pid, data)| {
                 let node = tree.root_mut().append(ProcessNode::Process(data)).id();
                 tree_map.insert(pid, node);
@@ -96,11 +110,11 @@ impl ProcessTree {
             let Some(parent_pid) = process.parent() else {
                 continue;
             };
-            tracing::debug!(?parent_pid, "fetching from tree map");
+            // tracing::debug!(?parent_pid, "fetching from tree map");
             let parent_id = tree_map
                 .get(&parent_pid)
                 .ok_or(eyre!("pid not in tree map"))?;
-            let process_data = ProcessData::from_process(process, cpu_count);
+            let process_data = ProcessData::from_process(process, cpu_count, memory);
             let id = tree
                 .get_mut(*parent_id)
                 .ok_or(eyre!("parent not in tree"))?

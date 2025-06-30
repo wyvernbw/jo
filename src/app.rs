@@ -11,20 +11,16 @@ use smol::{
     channel::{Receiver, Sender},
     stream::StreamExt,
 };
-use sysinfo::{CpuRefreshKind, Pid, System};
+use sysinfo::{CpuRefreshKind, System};
 
 use crate::process::{ProcessData, ProcessNode, ProcessTree, SkipPlaceholderRoot};
 
 #[derive(Debug, Default)]
 pub struct App {
     exit: bool,
+    tree_view: bool,
     system_information: Option<SystemInformation>,
     table_state: TableState,
-}
-
-#[derive(Debug, Clone)]
-struct ProcessBundle {
-    data: ProcessData,
 }
 
 #[derive(Debug)]
@@ -122,13 +118,17 @@ impl App {
     async fn sysinfo_task(tx: Sender<SystemInformation>) -> color_eyre::Result<()> {
         let mut system = System::new();
         system.refresh_cpu_list(CpuRefreshKind::default());
+        system.refresh_memory();
         let cpu_count = system.cpus().len();
+        let memory = system.total_memory();
+        tracing::info!(?memory);
         loop {
             system.refresh_all();
             let processes = system.processes();
             let ptree = ProcessTree::try_new()
                 .proc(processes)
                 .cpu_count(cpu_count)
+                .memory(memory)
                 .call()?;
             tx.send(SystemInformation { processes: ptree }).await?;
             smol::Timer::after(Duration::from_millis(2000)).await;
@@ -143,30 +143,12 @@ impl App {
         self.system_information = Some(res);
         Ok(LoopEvent::SysInfo)
     }
-}
 
-enum TreePrefix {
-    FirstChild,
-    MiddleChild,
-    LastChild,
-}
-
-impl Display for TreePrefix {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let res = match self {
-            TreePrefix::FirstChild => "",
-            TreePrefix::MiddleChild => " ├─",
-            TreePrefix::LastChild => " └─",
-        };
-        write!(f, "{}", res)
+    fn sort_by_cpu(a: &ProcessData, b: &ProcessData) -> Ordering {
+        b.cpu_usage.total_cmp(&a.cpu_usage)
     }
-}
 
-impl Widget for &mut App {
-    fn render(self, area: Rect, buf: &mut Buffer)
-    where
-        Self: Sized,
-    {
+    fn tree_sort_processes(&mut self) {
         let Some(system_information) = &mut self.system_information else {
             tracing::warn!("no system information");
             return;
@@ -176,10 +158,16 @@ impl Widget for &mut App {
             (ProcessNode::Root, ProcessNode::Root) => unreachable!("only one root for the tree"),
             (ProcessNode::Root, ProcessNode::Process(_)) => Ordering::Less,
             (ProcessNode::Process(_), ProcessNode::Root) => Ordering::Greater,
-            (ProcessNode::Process(a), ProcessNode::Process(b)) => {
-                b.cpu_usage.total_cmp(&a.cpu_usage)
-            }
+            (ProcessNode::Process(a), ProcessNode::Process(b)) => Self::sort_by_cpu(a, b),
         });
+    }
+
+    fn tree_get_process_rows<'a>(&self) -> Vec<Row<'a>> {
+        let Some(system_information) = &self.system_information else {
+            tracing::warn!("no system information");
+            return vec![];
+        };
+        let processes = &system_information.processes;
         let mut depth = 0usize;
         let rows = processes
             .0
@@ -208,7 +196,7 @@ impl Widget for &mut App {
             .map(|(depth, prefix, proc)| {
                 Row::new([
                     Cell::new(proc.pid.to_string()),
-                    Cell::new(format!("{}%", proc.cpu_usage)),
+                    Cell::new(format!("{:.2}%", proc.cpu_usage)),
                     Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string()),
                     Cell::new(format!(
                         "{}{} {}",
@@ -219,12 +207,93 @@ impl Widget for &mut App {
                 ])
             })
             .collect::<Vec<_>>();
+        rows
+    }
+
+    fn flatten_tree(&self) -> Vec<&ProcessData> {
+        let Some(system_information) = &self.system_information else {
+            tracing::warn!("no system information");
+            return vec![];
+        };
+        let processes = &system_information.processes;
+        let rows = processes
+            .0
+            .root()
+            .traverse()
+            .flat_map(|edge| match edge {
+                ego_tree::iter::Edge::Open(node_ref) => Some(node_ref),
+                ego_tree::iter::Edge::Close(_) => None,
+            })
+            .skip_placeholder_root()
+            .collect::<Vec<_>>();
+        rows
+    }
+
+    fn flat_map_process_to_row<'a>(proc: &ProcessData) -> Row<'a> {
+        Row::new([
+            Cell::new(proc.pid.to_string()),
+            Cell::new(format!("{:.2}%", proc.cpu_usage)),
+            Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string()),
+            Cell::new(format!("{:.2}%", proc.memory_percent)),
+            Cell::new(format!("{}", proc.name.display())),
+        ])
+    }
+
+    fn flat_get_process_rows<'a>(&self) -> Vec<Row<'a>> {
+        self.flatten_tree()
+            .into_iter()
+            .map(Self::flat_map_process_to_row)
+            .collect::<Vec<_>>()
+    }
+
+    fn get_process_rows<'a>(&mut self) -> Vec<Row<'a>> {
+        match self.tree_view {
+            true => {
+                self.tree_sort_processes();
+                self.tree_get_process_rows()
+            }
+            false => {
+                let mut rows = self.flatten_tree();
+                rows.sort_by(|&a, &b| Self::sort_by_cpu(a, b));
+                rows.into_iter()
+                    .map(Self::flat_map_process_to_row)
+                    .collect()
+            }
+        }
+    }
+}
+
+enum TreePrefix {
+    FirstChild,
+    MiddleChild,
+    LastChild,
+}
+
+impl Display for TreePrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let res = match self {
+            TreePrefix::FirstChild => "",
+            TreePrefix::MiddleChild => " ├─",
+            TreePrefix::LastChild => " └─",
+        };
+        write!(f, "{}", res)
+    }
+}
+
+impl Widget for &mut App {
+    fn render(self, area: Rect, buf: &mut Buffer)
+    where
+        Self: Sized,
+    {
+        let rows = self.get_process_rows();
+
         let table = Table::new(
             rows,
             [
-                Constraint::Min(20),
-                Constraint::Min(20),
-                Constraint::Min(20),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(12),
+                Constraint::Length(8),
                 Constraint::Min(20),
             ],
         );
