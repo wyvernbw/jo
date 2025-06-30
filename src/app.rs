@@ -13,6 +13,7 @@ use smol::{
     stream::StreamExt,
 };
 use sysinfo::{System, Users};
+use tui_textarea::TextArea;
 
 use crate::process::{ProcessData, ProcessNode, ProcessTree, SkipPlaceholderRoot};
 
@@ -24,6 +25,8 @@ pub struct App {
     system: System,
     users: Users,
     table_state: TableState,
+    search_term: Option<(String, usize)>,
+    search_cycle_queued: bool,
     mode: Mode,
 }
 
@@ -64,6 +67,10 @@ enum Command {
     Search,
     Go,
     Cancel,
+    Type(char),
+    Delete,
+    SearchConfirm,
+    NextSearchResult,
 }
 
 enum TreeData<'a> {
@@ -170,7 +177,7 @@ impl App {
     }
 
     fn handle_command(&mut self, command: Command) -> color_eyre::Result<()> {
-        match (&self.mode, command) {
+        match (&mut self.mode, command) {
             (Mode::Normal, Command::Quit) => {
                 self.exit = true;
                 tracing::info!("jo quitting");
@@ -188,6 +195,7 @@ impl App {
             (Mode::Normal, Command::Go) => {
                 self.mode = Mode::Go;
             }
+            (Mode::Normal, Command::Type(_)) => unreachable!(),
             (Mode::Normal, Command::Cancel) => {}
             (Mode::Go, Command::Quit) => {}
             (Mode::Go, Command::Search) => {}
@@ -195,6 +203,7 @@ impl App {
                 self.mode = Mode::Normal;
             }
             (Mode::Go, Command::Go) => unreachable!(),
+            (Mode::Go, Command::Type(_)) => unreachable!(),
             (Mode::Search(_), Command::Quit) => unreachable!(),
             (Mode::Search(_), Command::Down) => unreachable!(),
             (Mode::Search(_), Command::Up) => unreachable!(),
@@ -203,6 +212,29 @@ impl App {
                 self.mode = Mode::Normal;
             }
             (Mode::Search(_), Command::Go) => unreachable!(),
+            (Mode::Search(str), Command::Type(a)) => {
+                str.push(a);
+            }
+            (Mode::Search(search), Command::SearchConfirm) => {
+                self.search_term = Some((search.clone(), 0));
+                self.mode = Mode::Normal;
+            }
+            (Mode::Normal, Command::Delete) => unreachable!(),
+            (Mode::Go, Command::Delete) => unreachable!(),
+            (Mode::Search(str), Command::Delete) => {
+                str.pop();
+            }
+            (Mode::Normal, Command::SearchConfirm) => unreachable!(),
+            (Mode::Go, Command::SearchConfirm) => unreachable!(),
+            (Mode::Normal, Command::NextSearchResult)
+                if let Some((_, idx)) = &mut self.search_term =>
+            {
+                *idx += 1;
+                self.search_cycle_queued = true;
+            }
+            (Mode::Normal, Command::NextSearchResult) => {}
+            (Mode::Go, Command::NextSearchResult) => todo!(),
+            (Mode::Search(_), Command::NextSearchResult) => todo!(),
         };
         Ok(())
     }
@@ -217,6 +249,15 @@ impl App {
                 },
             ) => {
                 return Some(Command::Quit);
+            }
+            (
+                Mode::Normal,
+                KeyEvent {
+                    code: KeyCode::Char('n'),
+                    ..
+                },
+            ) => {
+                return Some(Command::NextSearchResult);
             }
             (
                 Mode::Normal | Mode::Go,
@@ -252,6 +293,27 @@ impl App {
                     ..
                 },
             ) => return Some(Command::Go),
+            (
+                Mode::Search(_),
+                KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                },
+            ) => return Some(Command::Type(*c)),
+            (
+                Mode::Search(_),
+                KeyEvent {
+                    code: KeyCode::Backspace,
+                    ..
+                },
+            ) => return Some(Command::Delete),
+            (
+                Mode::Search(_),
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                },
+            ) => return Some(Command::SearchConfirm),
             _ => {}
         };
         None
@@ -423,13 +485,71 @@ impl Widget for &mut App {
     where
         Self: Sized,
     {
+        let cycle_queued = self.search_cycle_queued;
+        self.search_cycle_queued = false;
+        let search_term = self.search_term.clone();
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(10), Constraint::Length(1)])
             .spacing(1)
             .split(area);
+        let mode = self.mode.clone();
         let mut state = self.table_state.clone();
         let proc_data = self.get_process_data();
+        if let Mode::Search(search) = &mode
+            && search != ""
+        {
+            let idx = match &proc_data {
+                TreeData::Flat(vec) => vec.iter().position(|data| {
+                    data.name
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&search.to_lowercase())
+                }),
+                TreeData::Tree(items) => items.iter().position(|(_, _, data)| {
+                    data.name
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&search.to_lowercase())
+                }),
+            };
+            state.select(idx);
+        }
+        if let Some((search, idx)) = search_term
+            && cycle_queued
+        {
+            let search = search.clone();
+            tracing::info!("cycled to {idx:?}");
+            let idx = match &proc_data {
+                TreeData::Flat(vec) => vec
+                    .iter()
+                    .enumerate()
+                    .cycle()
+                    .filter(|(_, data)| {
+                        data.name
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&search.to_lowercase())
+                    })
+                    .map(|(idx, _)| idx)
+                    .skip(idx)
+                    .next(),
+                TreeData::Tree(items) => items
+                    .iter()
+                    .enumerate()
+                    .cycle()
+                    .filter(|(_, (_, _, data))| {
+                        data.name
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&search.to_lowercase())
+                    })
+                    .map(|(idx, (_, _, _))| idx)
+                    .skip(idx)
+                    .next(),
+            };
+            state.select(idx);
+        }
         let rows = App::map_process_data(&proc_data);
 
         let table = Table::new(
@@ -448,11 +568,12 @@ impl Widget for &mut App {
                 .style(Style::new().bg(Color::Green).fg(Color::Indexed(0))),
         )
         .row_highlight_style(Style::new().bg(Color::White).fg(Color::Black));
+
         StatefulWidget::render(table, layout[0], buf, &mut state);
 
         let modeline_layout = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Max(32), Constraint::Min(2), Constraint::Max(32)])
+            .constraints([Constraint::Min(8), Constraint::Min(8)])
             .split(layout[1]);
 
         let (selected_pid, selected_name) = match state.selected() {
@@ -462,17 +583,35 @@ impl Widget for &mut App {
             ),
             None => (Cow::Borrowed(""), Cow::Borrowed("")),
         };
-        Paragraph::new(format!(" {} {}", self.mode, selected_pid))
-            .style(Style::new().bg(Color::Black))
-            .render(modeline_layout[0], buf);
-        Block::new()
-            .style(Style::new().bg(Color::Black))
-            .render(modeline_layout[1], buf);
+
+        match &mut self.mode {
+            Mode::Normal | Mode::Go => {
+                Paragraph::new(format!(" {} {}", self.mode, selected_pid))
+                    .style(Style::new().bg(Color::Black))
+                    .render(modeline_layout[0], buf);
+            }
+            Mode::Search(str) => {
+                let str = str.clone();
+
+                let search_layout = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Max(8), Constraint::Min(1)])
+                    .split(modeline_layout[0]);
+
+                Paragraph::new(format!(" {}: ", self.mode))
+                    .style(Style::new().bg(Color::Black))
+                    .render(search_layout[0], buf);
+
+                let mut text_area = TextArea::new(vec![str]);
+                text_area.move_cursor(tui_textarea::CursorMove::End);
+                text_area.render(search_layout[1], buf);
+            }
+        };
 
         Paragraph::new(selected_name)
             .style(Style::new().bg(Color::Black))
             .right_aligned()
-            .render(modeline_layout[2], buf);
+            .render(modeline_layout[1], buf);
 
         self.table_state = state;
     }
