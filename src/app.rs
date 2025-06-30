@@ -1,11 +1,11 @@
 use std::{borrow::Cow, cmp::Ordering, fmt::Display, ops::Index, time::Duration};
 
 use bytesize::ByteSize;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal,
     prelude::*,
-    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Cell, Paragraph, Row, Table, TableState},
 };
 use smol::{
     Timer,
@@ -71,6 +71,7 @@ enum Command {
     Delete,
     SearchConfirm,
     NextSearchResult,
+    PrevSearchResult,
 }
 
 enum TreeData<'a> {
@@ -235,6 +236,15 @@ impl App {
             (Mode::Normal, Command::NextSearchResult) => {}
             (Mode::Go, Command::NextSearchResult) => todo!(),
             (Mode::Search(_), Command::NextSearchResult) => todo!(),
+            (Mode::Normal, Command::PrevSearchResult)
+                if let Some((_, idx)) = &mut self.search_term =>
+            {
+                *idx = idx.saturating_sub(1);
+                self.search_cycle_queued = true;
+            }
+            (Mode::Normal, Command::PrevSearchResult) => todo!(),
+            (Mode::Go, Command::PrevSearchResult) => todo!(),
+            (Mode::Search(_), Command::PrevSearchResult) => todo!(),
         };
         Ok(())
     }
@@ -249,6 +259,15 @@ impl App {
                 },
             ) => {
                 return Some(Command::Quit);
+            }
+            (
+                Mode::Normal,
+                KeyEvent {
+                    code: KeyCode::Char('p'),
+                    ..
+                },
+            ) => {
+                return Some(Command::PrevSearchResult);
             }
             (
                 Mode::Normal,
