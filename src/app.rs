@@ -1,26 +1,48 @@
-use std::{cmp::Ordering, fmt::Display, time::Duration};
+use std::{borrow::Cow, cmp::Ordering, fmt::Display, ops::Index, time::Duration};
 
 use bytesize::ByteSize;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
+use ego_tree::NodeRef;
 use ratatui::{
     DefaultTerminal,
     prelude::*,
-    widgets::{Cell, Row, Table, TableState},
+    style::Styled,
+    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
 };
 use smol::{
+    Timer,
     channel::{Receiver, Sender},
     stream::StreamExt,
 };
-use sysinfo::{CpuRefreshKind, System};
+use sysinfo::{System, Users};
 
 use crate::process::{ProcessData, ProcessNode, ProcessTree, SkipPlaceholderRoot};
 
 #[derive(Debug, Default)]
 pub struct App {
     exit: bool,
-    tree_view: bool,
+    pub tree_view: bool,
     system_information: Option<SystemInformation>,
+    system: System,
+    users: Users,
     table_state: TableState,
+    mode: Mode,
+}
+
+#[derive(Debug, Default, Clone)]
+enum Mode {
+    #[default]
+    Normal,
+    Go,
+}
+
+impl Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Mode::Normal => write!(f, "NORM"),
+            Mode::Go => write!(f, "GO"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -37,35 +59,58 @@ enum LoopEvent {
 #[derive(Debug)]
 enum Command {
     Quit,
+    Down,
+    Up,
+}
+
+enum TreeData<'a> {
+    Tree(Vec<(usize, TreePrefix, &'a ProcessData)>),
+    Flat(Vec<&'a ProcessData>),
+}
+
+impl<'a> Index<usize> for TreeData<'a> {
+    type Output = ProcessData;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match self {
+            TreeData::Tree(items) => items[index].2,
+            TreeData::Flat(process_datas) => process_datas[index],
+        }
+    }
 }
 
 impl App {
     /// runs the application's main loop until the user quits
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
-        let (tx, rx) = smol::channel::bounded(32);
-        smol::spawn(async {
-            let res = Self::sysinfo_task(tx).await;
-            match res {
-                Ok(_) => tracing::info!("sysinfo task finished"),
-                Err(err) => tracing::error!(?err, "sysinfo task died"),
-            }
-        })
-        .detach();
-        let mut stream = crossterm::event::EventStream::new();
+        let input_channel = smol::channel::bounded(2);
+        smol::spawn(Self::input_task(input_channel.0)).detach();
+        self.fetch_system_information()?;
+        self.table_state.select_first();
+        let mut duration = Duration::from_millis(1500);
         while !self.exit {
-            let sys_info_event = self.receive_system_information(&rx);
-            let input_event = Self::get_input_event(&mut stream);
-            let event = smol::future::race(sys_info_event, input_event).await;
+            terminal.draw(|frame| self.draw(frame))?;
+            let input_event = Self::receive_input(&input_channel.1);
+            let event = smol::future::race(
+                async {
+                    Timer::after(duration).await;
+                    Ok(LoopEvent::SysInfo)
+                },
+                input_event,
+            )
+            .await;
             tracing::info!(?event);
             match event? {
                 LoopEvent::Input(command) => {
                     if let Err(err) = self.handle_command(command) {
                         tracing::warn!(%err);
                     }
+                    duration = Duration::from_millis(500);
                 }
-                LoopEvent::SysInfo => {}
+                LoopEvent::SysInfo => {
+                    self.fetch_system_information()?;
+                    duration = Duration::from_millis(1500);
+                }
             };
-            terminal.draw(|frame| self.draw(frame))?;
         }
         tracing::info!("jo event loop closed");
         Ok(())
@@ -73,6 +118,28 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         frame.render_widget(self, frame.area());
+    }
+
+    fn fetch_system_information(&mut self) -> color_eyre::Result<()> {
+        self.users.refresh();
+        self.system.refresh_all();
+        let processes = self.system.processes();
+        let ptree = ProcessTree::try_new()
+            .proc(&processes)
+            .system(&self.system)
+            .users(&self.users)
+            .call()?;
+        self.system_information = Some(SystemInformation { processes: ptree });
+        Ok(())
+    }
+
+    async fn input_task(tx: Sender<LoopEvent>) -> color_eyre::Result<()> {
+        let mut stream = crossterm::event::EventStream::new();
+        loop {
+            if let Ok(res) = Self::get_input_event(&mut stream).await {
+                tx.send(res).await?;
+            };
+        }
     }
 
     async fn get_input_event(stream: &mut EventStream) -> color_eyre::Result<LoopEvent> {
@@ -98,6 +165,10 @@ impl App {
                 self.exit = true;
                 tracing::info!("jo quitting");
             }
+            Command::Down => {
+                self.table_state.scroll_down_by(1);
+            }
+            Command::Up => self.table_state.scroll_up_by(1),
         };
         Ok(())
     }
@@ -110,38 +181,22 @@ impl App {
             } => {
                 return Some(Command::Quit);
             }
+            KeyEvent {
+                code: KeyCode::Char('j') | KeyCode::Down,
+                ..
+            } => return Some(Command::Down),
+            KeyEvent {
+                code: KeyCode::Char('k') | KeyCode::Up,
+                ..
+            } => return Some(Command::Up),
             _ => {}
         };
         None
     }
 
-    async fn sysinfo_task(tx: Sender<SystemInformation>) -> color_eyre::Result<()> {
-        let mut system = System::new();
-        system.refresh_cpu_list(CpuRefreshKind::default());
-        system.refresh_memory();
-        let cpu_count = system.cpus().len();
-        let memory = system.total_memory();
-        tracing::info!(?memory);
-        loop {
-            system.refresh_all();
-            let processes = system.processes();
-            let ptree = ProcessTree::try_new()
-                .proc(processes)
-                .cpu_count(cpu_count)
-                .memory(memory)
-                .call()?;
-            tx.send(SystemInformation { processes: ptree }).await?;
-            smol::Timer::after(Duration::from_millis(2000)).await;
-        }
-    }
-
-    async fn receive_system_information(
-        &mut self,
-        rx: &Receiver<SystemInformation>,
-    ) -> color_eyre::Result<LoopEvent> {
+    async fn receive_input(rx: &Receiver<LoopEvent>) -> color_eyre::Result<LoopEvent> {
         let res = rx.recv().await?;
-        self.system_information = Some(res);
-        Ok(LoopEvent::SysInfo)
+        Ok(res)
     }
 
     fn sort_by_cpu(a: &ProcessData, b: &ProcessData) -> Ordering {
@@ -162,7 +217,7 @@ impl App {
         });
     }
 
-    fn tree_get_process_rows<'a>(&self) -> Vec<Row<'a>> {
+    fn tree_get_process_data_points<'a>(&self) -> Vec<(usize, TreePrefix, &ProcessData)> {
         let Some(system_information) = &self.system_information else {
             tracing::warn!("no system information");
             return vec![];
@@ -193,11 +248,19 @@ impl App {
                 ProcessNode::Root => None,
                 ProcessNode::Process(proc) => Some((depth, prefix, proc)),
             })
+            .collect::<Vec<_>>();
+        rows
+    }
+
+    fn tree_map_process_rows<'b>(data: &[(usize, TreePrefix, &ProcessData)]) -> Vec<Row<'b>> {
+        data.into_iter()
             .map(|(depth, prefix, proc)| {
                 Row::new([
                     Cell::new(proc.pid.to_string()),
+                    Cell::new(proc.user.to_string()),
                     Cell::new(format!("{:.2}%", proc.cpu_usage)),
                     Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string()),
+                    Cell::new(format!("{:.2}%", proc.memory_percent)),
                     Cell::new(format!(
                         "{}{} {}",
                         " │ ".repeat(depth.saturating_sub(2)),
@@ -206,8 +269,7 @@ impl App {
                     )),
                 ])
             })
-            .collect::<Vec<_>>();
-        rows
+            .collect::<Vec<_>>()
     }
 
     fn flatten_tree(&self) -> Vec<&ProcessData> {
@@ -232,9 +294,12 @@ impl App {
     fn flat_map_process_to_row<'a>(proc: &ProcessData) -> Row<'a> {
         Row::new([
             Cell::new(proc.pid.to_string()),
-            Cell::new(format!("{:.2}%", proc.cpu_usage)),
-            Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string()),
-            Cell::new(format!("{:.2}%", proc.memory_percent)),
+            Cell::new(proc.user.to_string()).style(grey_out(proc.user == "root")),
+            Cell::new(format!("{:.2}%", proc.cpu_usage)).style(grey_out(proc.cpu_usage < 0.01)),
+            Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string())
+                .style(grey_out(proc.memory_usage == 0)),
+            Cell::new(format!("{:.2}%", proc.memory_percent))
+                .style(grey_out(proc.memory_percent < 0.01)),
             Cell::new(format!("{}", proc.name.display())),
         ])
     }
@@ -246,19 +311,29 @@ impl App {
             .collect::<Vec<_>>()
     }
 
-    fn get_process_rows<'a>(&mut self) -> Vec<Row<'a>> {
+    fn get_process_data<'a>(&'a mut self) -> TreeData<'a> {
         match self.tree_view {
             true => {
                 self.tree_sort_processes();
-                self.tree_get_process_rows()
+                let data = self.tree_get_process_data_points();
+                TreeData::Tree(data)
             }
             false => {
                 let mut rows = self.flatten_tree();
                 rows.sort_by(|&a, &b| Self::sort_by_cpu(a, b));
-                rows.into_iter()
-                    .map(Self::flat_map_process_to_row)
-                    .collect()
+                TreeData::Flat(rows)
             }
+        }
+    }
+
+    fn map_process_data<'a>(data: &TreeData<'a>) -> Vec<Row<'a>> {
+        match data {
+            TreeData::Tree(data) => Self::tree_map_process_rows(&data),
+            TreeData::Flat(data) => data
+                .iter()
+                .cloned()
+                .map(Self::flat_map_process_to_row)
+                .collect(),
         }
     }
 }
@@ -285,18 +360,64 @@ impl Widget for &mut App {
     where
         Self: Sized,
     {
-        let rows = self.get_process_rows();
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(1)])
+            .spacing(1)
+            .split(area);
+        let mut state = self.table_state.clone();
+        let proc_data = self.get_process_data();
+        let rows = App::map_process_data(&proc_data);
 
         let table = Table::new(
             rows,
             [
                 Constraint::Length(8),
+                Constraint::Max(10),
                 Constraint::Length(8),
-                Constraint::Length(12),
+                Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Min(20),
             ],
-        );
-        StatefulWidget::render(table, area, buf, &mut self.table_state);
+        )
+        .header(
+            Row::new(["PID", "USER", "CPU%", "MEM(B)", "MEM%", "Command"])
+                .style(Style::new().bg(Color::Green).fg(Color::Indexed(0))),
+        )
+        .row_highlight_style(Style::new().bg(Color::White).fg(Color::Black));
+        StatefulWidget::render(table, layout[0], buf, &mut state);
+
+        let modeline_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Max(32), Constraint::Min(2), Constraint::Max(32)])
+            .split(layout[1]);
+
+        let (selected_pid, selected_name) = match state.selected() {
+            Some(idx) => (
+                Cow::Owned(format!("@ {}", proc_data[idx].pid,)),
+                Cow::Owned(format!("{}", proc_data[idx].name.display())),
+            ),
+            None => (Cow::Borrowed(""), Cow::Borrowed("")),
+        };
+        Paragraph::new(format!(" {} {}", self.mode, selected_pid))
+            .style(Style::new().bg(Color::Black))
+            .render(modeline_layout[0], buf);
+        Block::new()
+            .style(Style::new().bg(Color::Black))
+            .render(modeline_layout[1], buf);
+
+        Paragraph::new(selected_name)
+            .style(Style::new().bg(Color::Black))
+            .right_aligned()
+            .render(modeline_layout[2], buf);
+
+        self.table_state = state;
+    }
+}
+
+fn grey_out(condition: bool) -> Style {
+    match condition {
+        true => Style::new().dark_gray(),
+        false => Style::new(),
     }
 }

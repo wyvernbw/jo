@@ -1,3 +1,5 @@
+#![feature(f16)]
+
 mod app;
 mod process;
 
@@ -28,7 +30,13 @@ static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     path
 });
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() -> color_eyre::Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
     color_eyre::install()?;
     let writer = std::fs::OpenOptions::new()
         .create(true)
@@ -44,7 +52,9 @@ fn main() -> color_eyre::Result<()> {
     tracing::info!("jo started");
 
     let mut terminal = ratatui::init();
-    let app_result = smol::block_on(App::default().run(&mut terminal));
+    let mut app = App::default();
+    app.tree_view = false;
+    let app_result = smol::block_on(app.run(&mut terminal));
 
     ratatui::restore();
     app_result

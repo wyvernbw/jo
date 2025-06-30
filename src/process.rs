@@ -3,35 +3,44 @@ use std::{cmp::Ordering, collections::HashMap, ffi::OsString};
 use bon::builder;
 use color_eyre::eyre::eyre;
 use ego_tree::{NodeId, NodeRef, Tree};
-use sysinfo::{Pid, Process};
+use sysinfo::{Pid, Process, System, User, Users};
 
 #[derive(Debug, Clone)]
 pub struct ProcessData {
+    pub user: String,
     pub name: OsString,
     pub pid: Pid,
-    pub cpu_usage: f32,
-    pub memory_percent: f32,
+    pub cpu_usage: f16,
+    pub memory_percent: f16,
     pub memory_usage: u64,
 }
 
 impl ProcessData {
-    pub fn from_process(value: &Process, cpu_count: usize, memory: u64) -> Self {
+    pub fn from_process(value: &Process, system: &System, users: &Users) -> Self {
+        let cpu_count = system.cpus().len();
+        let memory = system.total_memory();
         let name = match value.exe() {
             Some(exe) => exe.as_os_str().to_os_string(),
             None => value.name().to_os_string(),
         };
+        let user = value.user_id();
+        let user = user
+            .and_then(|id| users.get_user_by_id(id))
+            .map(|user| user.name().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         let cpu_usage = value.cpu_usage() as f64 / (cpu_count as f64);
-        let cpu_usage = cpu_usage as f32;
+        let cpu_usage = cpu_usage as f16;
         let memory_usage = value.memory();
         let memory_percent = {
             let memory_percent = (memory_usage as f64) / (memory as f64);
             let memory_percent = memory_percent * 100.0;
-            memory_percent as f32
+            memory_percent as f16
         };
         let pid = value.pid();
         ProcessData {
             pid,
             name,
+            user,
             cpu_usage,
             memory_usage,
             memory_percent,
@@ -71,8 +80,8 @@ impl ProcessTree {
     #[builder]
     pub fn try_new(
         proc: &HashMap<Pid, Process>,
-        cpu_count: usize,
-        memory: u64,
+        system: &System,
+        users: &Users,
     ) -> color_eyre::Result<Self> {
         let mut stack = vec![];
         stack.reserve(proc.len());
@@ -81,7 +90,7 @@ impl ProcessTree {
         let mut tree_map = HashMap::<Pid, NodeId>::default();
         proc.iter()
             .filter(|&(_, process)| process.parent().is_none())
-            .map(|(pid, process)| (pid, ProcessData::from_process(process, cpu_count, memory)))
+            .map(|(pid, process)| (pid, ProcessData::from_process(process, system, users)))
             .for_each(|(&pid, data)| {
                 let node = tree.root_mut().append(ProcessNode::Process(data)).id();
                 tree_map.insert(pid, node);
@@ -114,12 +123,13 @@ impl ProcessTree {
             let parent_id = tree_map
                 .get(&parent_pid)
                 .ok_or(eyre!("pid not in tree map"))?;
-            let process_data = ProcessData::from_process(process, cpu_count, memory);
+            let process_data = ProcessData::from_process(process, system, users);
             let id = tree
                 .get_mut(*parent_id)
                 .ok_or(eyre!("parent not in tree"))?
                 .append(ProcessNode::Process(process_data))
                 .id();
+            assert!(tree_map.get(&process.pid()).is_none());
             tree_map.insert(process.pid(), id);
         }
 
