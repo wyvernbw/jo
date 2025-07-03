@@ -94,37 +94,40 @@ impl App {
     /// runs the application's main loop until the user quits
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let input_channel = smol::channel::bounded(2);
-        let mode_channel = smol::channel::bounded(2);
+        let mode_channel = smol::channel::unbounded();
+
         mode_channel.0.send(self.mode.clone()).await?;
+
         smol::spawn(Self::input_task(input_channel.0, mode_channel.1)).detach();
+
         self.fetch_system_information()?;
         self.table_state.select_first();
         let mut duration = Duration::from_millis(1500);
+        terminal.draw(|frame| self.draw(frame))?;
+
         while !self.exit {
-            terminal.draw(|frame| self.draw(frame))?;
             let input_event = Self::receive_input(&input_channel.1);
-            let event = smol::future::race(
-                async {
-                    Timer::after(duration).await;
-                    Ok(LoopEvent::SysInfo)
-                },
-                input_event,
-            )
-            .await;
+            let sysinfo_event = async {
+                Timer::after(duration).await;
+                Ok(LoopEvent::SysInfo)
+            };
+            let event = smol::future::race(sysinfo_event, input_event).await;
             tracing::info!(?event);
+
             match event? {
                 LoopEvent::Input(command) => {
                     if let Err(err) = self.handle_command(command) {
                         tracing::warn!(%err);
                     }
-                    duration = Duration::from_millis(500);
                     mode_channel.0.send(self.mode.clone()).await?;
+                    duration = Duration::from_millis(500);
                 }
                 LoopEvent::SysInfo => {
                     self.fetch_system_information()?;
                     duration = Duration::from_millis(1500);
                 }
             };
+            terminal.draw(|frame| self.draw(frame))?;
         }
         tracing::info!("jo event loop closed");
         Ok(())
