@@ -1,5 +1,5 @@
 use bytesize::ByteSize;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::{
     prelude::*,
     widgets::{Cell, Paragraph, Row, Table},
@@ -28,6 +28,81 @@ pub struct App {
     users: Arc<Mutex<Users>>,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        App {
+            system: default(),
+            users: default(),
+            poll_rate: Duration::from_millis(1500),
+        }
+    }
+}
+
+impl App {
+    async fn fetch_sysinfo_task(self: Self, tx: Sender<AppEvent>) -> color_eyre::Result<()> {
+        loop {
+            let mut system = self.system.lock().await;
+            let mut users = self.users.lock().await;
+            system.refresh_all();
+            users.refresh();
+            let proc = system.processes();
+            let data = proc
+                .iter()
+                .map(|(pid, proc)| (*pid, ProcessData::from_process(proc, &system, &users)))
+                .collect();
+            let proc = ProcessTree::try_new().proc(proc).call();
+            drop(system);
+            drop(users);
+            if let Ok(proc) = proc {
+                tx.send(AppEvent::UpdateProcess(proc, data)).await?;
+            }
+            Timer::after(self.poll_rate).await;
+        }
+    }
+
+    async fn input_task(tx: Sender<AppEvent>) -> color_eyre::Result<()> {
+        let mut stream = crossterm::event::EventStream::new();
+        loop {
+            if let Some(Ok(input_event)) = stream.next().await {
+                tx.send(AppEvent::Input(input_event)).await?;
+            };
+        }
+    }
+
+    async fn run_side_effects(&mut self, transition: &Transition) {
+        match transition {
+            Transition::KillProcess(pid) => {
+                if let Some(process) = self.system.lock().await.process(*pid) {
+                    process.kill();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub async fn run(mut self, term: &mut DefaultTerminal) -> color_eyre::Result<()> {
+        let mut state = State::default();
+        let event_channel = smol::channel::unbounded();
+        smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone())).detach();
+        smol::spawn(Self::input_task(event_channel.0.clone())).detach();
+
+        term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
+        state.process_table_state.select_first();
+        loop {
+            let event = event_channel.1.recv().await?;
+            let transition = event.into_transition(&state);
+
+            self.run_side_effects(&transition).await;
+            state = transition.transition(state);
+            state = state.prepare();
+            if state.exit {
+                break Ok(());
+            }
+            term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
+        }
+    }
+}
+
 enum AppEvent {
     UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
     Input(Event),
@@ -35,6 +110,10 @@ enum AppEvent {
 
 impl AppEvent {
     fn into_transition(self, state: &State) -> Transition {
+        let selected_pid = match (&state.process_rows, state.process_table_state.selected()) {
+            (Some(process_rows), Some(idx)) => Some(process_rows[idx].2),
+            _ => None,
+        };
         match (&state.mode, self) {
             (_, AppEvent::UpdateProcess(process_tree, hash_map)) => {
                 Transition::UpdateProcess(process_tree, hash_map)
@@ -47,6 +126,10 @@ impl AppEvent {
                     (KeyCode::Char('/'), _) => Transition::StartSearch,
                     (KeyCode::Char('n'), _) => Transition::NextSearchResult,
                     (KeyCode::Char('p'), _) => Transition::PrevSearchResult,
+                    (KeyCode::Char('d'), _) if let Some(selected_pid) = selected_pid => {
+                        Transition::KillProcess(selected_pid)
+                    }
+                    (KeyCode::Char('d'), _) if let None = selected_pid => Transition::None,
                     _ => Transition::None,
                 }
             }
@@ -137,6 +220,31 @@ impl State {
                 mode: Mode::Search(search_state),
                 ..self
             },
+        }
+    }
+    fn refresh_search(self) -> State {
+        if let Some(search_state) = self.old_search_state.clone() {
+            self.update_search(search_state)
+        } else {
+            self
+        }
+    }
+    fn hook_search(mut self) -> State {
+        if let Some(search_state) = &mut self.old_search_state {
+            search_state.hooked = true;
+        }
+        self
+    }
+    fn unhook_search(mut self) -> State {
+        if let Some(search_state) = &mut self.old_search_state {
+            search_state.hooked = false;
+        }
+        self
+    }
+    fn refresh_search_if_hooked(self) -> State {
+        match self.old_search_state.clone() {
+            Some(search_state) if search_state.hooked => self.update_search(search_state),
+            _ => self,
         }
     }
     fn prepare(mut self) -> State {
@@ -247,10 +355,21 @@ enum Mode {
     Search(SearchState),
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct SearchState {
     term: Arc<str>,
     idx: isize,
+    hooked: bool,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        SearchState {
+            term: "".into(),
+            idx: 0,
+            hooked: true,
+        }
+    }
 }
 
 impl Display for Mode {
@@ -329,6 +448,7 @@ enum Transition {
     CompleteSearch,
     NextSearchResult,
     PrevSearchResult,
+    KillProcess(Pid),
 }
 
 #[derive(Debug)]
@@ -346,18 +466,12 @@ impl Transition {
                 ..state
             },
             (_, Transition::UpdateProcess(tree, data)) => {
-                let search_state = state.old_search_state.clone();
                 let new_state = State {
                     process_tree: tree,
                     process_data: data,
                     ..state
                 };
-                if let Some(search_state) = search_state {
-                    let new_state = new_state.prepare();
-                    new_state.update_search(search_state)
-                } else {
-                    new_state
-                }
+                new_state.prepare().refresh_search_if_hooked()
             }
             (_, Transition::ScrollUp) => {
                 let mut table_state = state.process_table_state;
@@ -366,6 +480,7 @@ impl Transition {
                     process_table_state: table_state,
                     ..state
                 }
+                .unhook_search()
             }
             (_, Transition::ScrollDown) => {
                 let mut table_state = state.process_table_state;
@@ -374,7 +489,9 @@ impl Transition {
                     process_table_state: table_state,
                     ..state
                 }
+                .unhook_search()
             }
+            (_, Transition::KillProcess(_)) => state.refresh_search(),
             (Mode::Normal, Transition::SearchType(_)) => unreachable!(),
             (Mode::Search(search_state), Transition::SearchType(search_type_transition)) => {
                 let new_term = match search_type_transition {
@@ -391,6 +508,7 @@ impl Transition {
                 };
                 state.update_search(SearchState {
                     term: new_term,
+                    hooked: true,
                     ..search_state
                 })
             }
@@ -401,7 +519,7 @@ impl Transition {
                 }) else {
                     return state;
                 };
-                state.update_search(search_state)
+                state.update_search(search_state).hook_search()
             }
             (Mode::Normal | Mode::Search(_), Transition::PrevSearchResult) => {
                 let Some(search_state) = state.old_search_state.as_ref().map(|st| SearchState {
@@ -410,7 +528,7 @@ impl Transition {
                 }) else {
                     return state;
                 };
-                state.update_search(search_state)
+                state.update_search(search_state).hook_search()
             }
             (Mode::Normal, Transition::StartSearch) => State {
                 mode: Mode::Search(SearchState::default()),
@@ -423,73 +541,8 @@ impl Transition {
                 mode: Mode::Normal,
                 old_search_state: Some(search_state.clone()),
                 ..state
-            },
-        }
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        App {
-            system: default(),
-            users: default(),
-            poll_rate: Duration::from_millis(1500),
-        }
-    }
-}
-
-impl App {
-    async fn fetch_sysinfo_task(self: Self, tx: Sender<AppEvent>) -> color_eyre::Result<()> {
-        loop {
-            let mut system = self.system.lock().await;
-            let mut users = self.users.lock().await;
-            system.refresh_all();
-            users.refresh();
-            let proc = system.processes();
-            let data = proc
-                .iter()
-                .map(|(pid, proc)| (*pid, ProcessData::from_process(proc, &system, &users)))
-                .collect();
-            let proc = ProcessTree::try_new().proc(proc).call();
-            drop(system);
-            drop(users);
-            if let Ok(proc) = proc {
-                tx.send(AppEvent::UpdateProcess(proc, data)).await?;
             }
-            Timer::after(self.poll_rate).await;
-        }
-    }
-
-    async fn input_task(tx: Sender<AppEvent>) -> color_eyre::Result<()> {
-        let mut stream = crossterm::event::EventStream::new();
-        loop {
-            if let Some(Ok(input_event)) = stream.next().await {
-                tx.send(AppEvent::Input(input_event)).await?;
-            };
-        }
-    }
-
-    fn run_side_effects(&mut self, transition: &Transition) {}
-
-    pub async fn run(mut self, term: &mut DefaultTerminal) -> color_eyre::Result<()> {
-        let mut state = State::default();
-        state.process_table_state.select_first();
-        let event_channel = smol::channel::unbounded();
-        smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone())).detach();
-        smol::spawn(Self::input_task(event_channel.0.clone())).detach();
-
-        term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
-        loop {
-            let event = event_channel.1.recv().await?;
-            let transition = event.into_transition(&state);
-
-            self.run_side_effects(&transition);
-            state = transition.transition(state);
-            state = state.prepare();
-            if state.exit {
-                break Ok(());
-            }
-            term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
+            .hook_search(),
         }
     }
 }
@@ -507,12 +560,15 @@ impl StatefulWidget for &App {
             .spacing(1)
             .split(area);
 
+        let term_height = crossterm::terminal::size().map(|(c, r)| r).unwrap_or(64) as usize;
+        let selected_idx = state.process_table_state.selected().unwrap_or_default();
         let proc_data = state
             .process_rows
             .clone()
             .unwrap_or(vec![])
             .iter()
             .cloned()
+            .take(term_height + selected_idx)
             .flat_map(|(depth, prefix, proc)| {
                 Some((depth, prefix)).zip(state.process_data.get(&proc))
             })
@@ -520,7 +576,13 @@ impl StatefulWidget for &App {
             .collect::<Vec<_>>();
         let rows = proc_data
             .iter()
-            .map(|(depth, prefix, proc)| state.process_view.make_row(*depth, prefix, proc));
+            .enumerate()
+            .map(|(idx, (depth, prefix, proc))| {
+                if idx + term_height < selected_idx {
+                    return Row::default();
+                }
+                state.process_view.make_row(*depth, prefix, proc)
+            });
 
         let table = Table::new(
             rows,
@@ -539,7 +601,12 @@ impl StatefulWidget for &App {
         )
         .row_highlight_style(Style::new().bg(Color::White).fg(Color::Black));
 
-        StatefulWidget::render(table, layout[0], buf, &mut state.process_table_state);
+        StatefulWidget::render(
+            table,
+            layout[0],
+            buf,
+            &mut state.process_table_state.clone(),
+        );
 
         let modeline_layout = Layout::default()
             .direction(Direction::Horizontal)
