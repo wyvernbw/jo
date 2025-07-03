@@ -1,9 +1,8 @@
 use std::{cmp::Ordering, collections::HashMap, ffi::OsString};
 
-use bon::builder;
 use color_eyre::eyre::eyre;
 use ego_tree::{NodeId, NodeRef, Tree};
-use sysinfo::{Pid, Process, System, User, Users};
+use sysinfo::{Pid, Process, System, Users};
 
 #[derive(Debug, Clone)]
 pub struct ProcessData {
@@ -51,7 +50,7 @@ impl ProcessData {
 #[derive(Debug)]
 pub enum ProcessNode {
     Root,
-    Process(ProcessData),
+    Process(Pid),
 }
 
 impl ProcessNode {
@@ -75,14 +74,17 @@ impl ProcessNode {
 #[derive(Debug)]
 pub struct ProcessTree(pub Tree<ProcessNode>);
 
+impl Default for ProcessTree {
+    fn default() -> Self {
+        let tree = Tree::new(ProcessNode::Root);
+        ProcessTree(tree)
+    }
+}
+
 #[bon::bon]
 impl ProcessTree {
     #[builder]
-    pub fn try_new(
-        proc: &HashMap<Pid, Process>,
-        system: &System,
-        users: &Users,
-    ) -> color_eyre::Result<Self> {
+    pub fn try_new(proc: &HashMap<Pid, Process>) -> color_eyre::Result<Self> {
         let mut stack = vec![];
         stack.reserve(proc.len());
 
@@ -90,20 +92,11 @@ impl ProcessTree {
         let mut tree_map = HashMap::<Pid, NodeId>::default();
         proc.iter()
             .filter(|&(_, process)| process.parent().is_none())
-            .map(|(pid, process)| (pid, ProcessData::from_process(process, system, users)))
-            .for_each(|(&pid, data)| {
-                let node = tree.root_mut().append(ProcessNode::Process(data)).id();
+            .for_each(|(&pid, _)| {
+                let node = tree.root_mut().append(ProcessNode::Process(pid)).id();
                 tree_map.insert(pid, node);
                 stack.push(pid);
             });
-        tracing::info!(
-            "root processes: {:?}",
-            tree.root()
-                .children()
-                .skip_placeholder_root()
-                .map(|node| node.name.display())
-                .collect::<Vec<_>>()
-        );
 
         tracing::info!(initial_tree_map = ?tree_map);
         while let Some(value) = stack.pop() {
@@ -123,11 +116,10 @@ impl ProcessTree {
             let parent_id = tree_map
                 .get(&parent_pid)
                 .ok_or(eyre!("pid not in tree map"))?;
-            let process_data = ProcessData::from_process(process, system, users);
             let id = tree
                 .get_mut(*parent_id)
                 .ok_or(eyre!("parent not in tree"))?
-                .append(ProcessNode::Process(process_data))
+                .append(ProcessNode::Process(process.pid()))
                 .id();
             assert!(tree_map.get(&process.pid()).is_none());
             tree_map.insert(process.pid(), id);
@@ -159,14 +151,14 @@ impl ProcessTree {
 }
 
 pub trait SkipPlaceholderRoot<'a> {
-    fn skip_placeholder_root(self) -> impl Iterator<Item = &'a ProcessData>;
+    fn skip_placeholder_root(self) -> impl Iterator<Item = &'a Pid>;
 }
 
 impl<'a, I> SkipPlaceholderRoot<'a> for I
 where
     I: Iterator<Item = NodeRef<'a, ProcessNode>>,
 {
-    fn skip_placeholder_root(self) -> impl Iterator<Item = &'a ProcessData> {
+    fn skip_placeholder_root(self) -> impl Iterator<Item = &'a Pid> {
         self.flat_map(|node| match node.value() {
             ProcessNode::Root => None,
             ProcessNode::Process(proc) => Some(proc),
