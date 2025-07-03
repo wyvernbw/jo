@@ -242,8 +242,12 @@ impl State {
         self
     }
     fn refresh_search_if_hooked(self) -> State {
-        match self.old_search_state.clone() {
-            Some(search_state) if search_state.hooked => self.update_search(search_state),
+        match (self.mode.clone(), self.old_search_state.clone()) {
+            (Mode::Normal, Some(search_state)) | (Mode::Search(search_state), _)
+                if search_state.hooked =>
+            {
+                self.update_search(search_state)
+            }
             _ => self,
         }
     }
@@ -506,11 +510,13 @@ impl Transition {
                         term
                     }
                 };
-                state.update_search(SearchState {
-                    term: new_term,
-                    hooked: true,
-                    ..search_state
-                })
+                state
+                    .update_search(SearchState {
+                        term: new_term,
+                        hooked: true,
+                        ..search_state
+                    })
+                    .hook_search()
             }
             (Mode::Normal | Mode::Search(_), Transition::NextSearchResult) => {
                 let Some(search_state) = state.old_search_state.as_ref().map(|st| SearchState {
