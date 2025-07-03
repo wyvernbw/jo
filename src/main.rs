@@ -1,5 +1,8 @@
 #![feature(if_let_guard)]
 #![feature(f16)]
+#![feature(try_blocks)]
+#![feature(unboxed_closures)]
+#![feature(fn_traits)]
 
 mod app;
 mod process;
@@ -35,6 +38,10 @@ static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+pub fn default<T: Default>() -> T {
+    T::default()
+}
+
 fn main() -> color_eyre::Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
@@ -53,8 +60,7 @@ fn main() -> color_eyre::Result<()> {
     tracing::info!("jo started");
 
     let mut terminal = ratatui::init();
-    let mut app = App::default();
-    app.tree_view = false;
+    let app = App::default();
     let app_result = smol::block_on(app.run(&mut terminal));
 
     ratatui::restore();
