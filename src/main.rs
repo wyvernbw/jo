@@ -99,10 +99,17 @@ fn main() -> color_eyre::Result<()> {
     tracing::info!(?CONFIG_PATH);
     tracing::info!(?LOG_PATH);
 
+    let res = std::panic::catch_unwind(|| {
+        ratatui::restore();
+    });
+    if let Err(err) = res {
+        tracing::warn!(?err, "failed to hook panic handler.");
+    }
+
     let mut terminal = ratatui::init();
     let app = App::default();
     let app_result = smol::block_on(app.run(&mut terminal));
-
     ratatui::restore();
+
     app_result
 }

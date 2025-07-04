@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Cell, Row, TableState},
 };
 use sysinfo::Pid;
+use tachyonfx::{Duration, Effect, EffectTimer, Shader, fx};
 
 use crate::{
     app::grey_out,
@@ -27,6 +28,8 @@ pub struct State {
     pub process_rows: Option<Vec<ProcessRow>>,
     pub process_data: HashMap<Pid, ProcessData>,
     pub process_table_state: TableState,
+    pub effects: TuiEffects,
+    pub dt: Duration,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -325,6 +328,7 @@ impl Display for TreePrefix {
 #[derive(Debug)]
 pub enum Transition {
     None,
+    UpdateDt(Duration),
     UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
     Exit,
     ScrollUp,
@@ -351,6 +355,7 @@ impl Transition {
                 exit: true,
                 ..state
             },
+            (_, Transition::UpdateDt(dt)) => State { dt, ..state },
             (_, Transition::UpdateProcess(tree, data)) => {
                 let new_state = State {
                     process_tree: tree,
@@ -407,12 +412,8 @@ impl Transition {
                 }) else {
                     return state;
                 };
-                tracing::info!(?search_state);
-                tracing::info!(?state);
                 let state = state.update_search(search_state);
-                tracing::info!(?state);
                 let state = state.hook_search();
-                tracing::info!(?state);
                 state
             }
             (Mode::Normal | Mode::Search(_), Transition::PrevSearchResult) => {
@@ -438,5 +439,91 @@ impl Transition {
             }
             .hook_search(),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiEffects {
+    pub table_slide_in: Effect,
+    pub modeline_slide_in_left: Effect,
+    pub modeline_slide_in_right: Effect,
+    pub state: TuiEffectState,
+}
+
+const EFFECT_COUNT: usize = 3;
+const EFFECT_MASK: u32 = (1 << EFFECT_COUNT) - 1;
+
+impl TuiEffects {
+    pub fn new() -> Self {
+        let table_slide_in_ms = 500;
+        Self {
+            table_slide_in: fx::slide_in(
+                tachyonfx::Motion::UpToDown,
+                12,
+                0,
+                Color::Reset,
+                EffectTimer::from_ms(table_slide_in_ms, tachyonfx::Interpolation::CubicInOut),
+            ),
+            modeline_slide_in_left: fx::slide_in(
+                tachyonfx::Motion::RightToLeft,
+                12,
+                0,
+                Color::White,
+                EffectTimer::from_ms(500, tachyonfx::Interpolation::CubicInOut),
+            ),
+            modeline_slide_in_right: fx::slide_in(
+                tachyonfx::Motion::LeftToRight,
+                12,
+                0,
+                Color::White,
+                EffectTimer::from_ms(600, tachyonfx::Interpolation::CubicInOut),
+            ),
+            state: TuiEffectState::default(),
+        }
+    }
+    pub fn update(mut self) -> Self {
+        match &mut self {
+            TuiEffects {
+                table_slide_in,
+                modeline_slide_in_left,
+                modeline_slide_in_right,
+                state,
+            } => {
+                state.set_effect_state(0, &table_slide_in);
+                state.set_effect_state(1, &modeline_slide_in_left);
+                state.set_effect_state(2, &modeline_slide_in_right);
+            }
+        };
+        self
+    }
+}
+
+impl Default for TuiEffects {
+    fn default() -> Self {
+        TuiEffects::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiEffectState(BitVec);
+
+impl TuiEffectState {
+    pub fn new() -> Self {
+        TuiEffectState(BitVec::from_elem(32, false))
+    }
+    pub fn all_done(&self) -> bool {
+        let [value] = *self.0.storage() else {
+            panic!("what the fuck")
+        };
+        value & EFFECT_MASK == 1
+    }
+    pub fn set_effect_state(&mut self, idx: usize, effect: &Effect) {
+        self.0.set(idx, !effect.running());
+    }
+}
+
+impl Default for TuiEffectState {
+    fn default() -> Self {
+        TuiEffectState::new()
     }
 }

@@ -4,6 +4,7 @@ mod tests;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use notify::{RecursiveMode, Watcher};
 use ratatui::{
+    layout::Offset,
     prelude::*,
     widgets::{Paragraph, Row, Table},
 };
@@ -11,17 +12,27 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     collections::HashMap,
+    fmt::Display,
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
+use tachyonfx::{Duration as FxDuration, EffectRenderer, EffectTimer, Shader, fx};
 
 use ratatui::{DefaultTerminal, widgets::Widget};
 use smol::{
-    Timer, channel::Sender, fs::DirEntry, io::AsyncReadExt, lock::Mutex, stream::StreamExt,
+    Timer,
+    channel::{Receiver, Sender},
+    fs::DirEntry,
+    io::AsyncReadExt,
+    lock::Mutex,
+    stream::StreamExt,
 };
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System, Users};
 
-use crate::{APP_DIR, CONFIG_DIR, app::state::SearchTypeTransition};
+use crate::{
+    APP_DIR, CONFIG_DIR,
+    app::state::{SearchTypeTransition, TuiEffectState},
+};
 use crate::{CONFIG_PATH, app::state::Mode};
 use crate::{THEMES_DIR, app::state::State};
 use crate::{
@@ -63,6 +74,7 @@ impl Default for App {
     }
 }
 
+#[bon::bon]
 impl App {
     async fn config_hot_reload_task(tx: Sender<AppEvent>) -> color_eyre::Result<()> {
         let event_channel = mpsc::channel::<notify::Result<notify::Event>>();
@@ -187,14 +199,26 @@ impl App {
     pub async fn run(mut self, term: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let mut state = State::default();
         let event_channel = smol::channel::unbounded();
+        let shader_event_channel = smol::channel::unbounded();
         let _handle_1 = smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone()));
         let _handle_2 = smol::spawn(Self::input_task(event_channel.0.clone()));
         let _handle_3 = smol::spawn(Self::config_hot_reload_task(event_channel.0.clone()));
+        let _handle_4 = smol::spawn(Self::effects_task(
+            event_channel.0.clone(),
+            shader_event_channel.1,
+        ));
 
-        term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
+        // term.draw(|frame| self.draw().frame(frame).state(&mut state).call())?;
         state.process_table_state.select_first();
         loop {
+            if !state.effects.state.all_done() {
+                shader_event_channel
+                    .0
+                    .send(state.effects.state.clone())
+                    .await?;
+            }
             let event = event_channel.1.recv().await?;
+            tracing::info!(%event);
             if let AppEvent::ReloadConfig = event {
                 self = self.load_themes().await?;
                 self = self.load_config().await?;
@@ -210,71 +234,38 @@ impl App {
             if state.exit {
                 break Ok(());
             }
-            term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
+            term.draw(|frame| self.draw().frame(frame).state(&mut state).call())?;
+
+            state.effects = state.effects.update();
         }
     }
-}
 
-enum AppEvent {
-    ReloadConfig,
-    UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
-    Input(Event),
-}
-
-impl AppEvent {
-    fn into_transition(self, state: &State) -> Transition {
-        let selected_pid = match (&state.process_rows, state.process_table_state.selected()) {
-            (Some(process_rows), Some(idx)) => Some(process_rows[idx].2),
-            _ => None,
-        };
-        match (&state.mode, self) {
-            (_, AppEvent::ReloadConfig) => Transition::None,
-            (_, AppEvent::UpdateProcess(process_tree, hash_map)) => {
-                Transition::UpdateProcess(process_tree, hash_map)
+    async fn effects_task(
+        tx: Sender<AppEvent>,
+        rx: Receiver<TuiEffectState>,
+    ) -> color_eyre::Result<()> {
+        let mut now = Instant::now();
+        let fps = Duration::from_secs_f64(1.0 / 60.0);
+        loop {
+            let state = rx.recv().await?;
+            if state.all_done() {
+                continue;
             }
-            (Mode::Normal, AppEvent::Input(Event::Key(key_event))) => {
-                match (key_event.code, key_event.modifiers) {
-                    (KeyCode::Char('q'), _) => Transition::Exit,
-                    (KeyCode::Char('j'), _) => Transition::ScrollDown,
-                    (KeyCode::Char('k'), _) => Transition::ScrollUp,
-                    (KeyCode::Char('/'), _) => Transition::StartSearch,
-                    (KeyCode::Char('n'), _) => Transition::NextSearchResult,
-                    (KeyCode::Char('p'), _) => Transition::PrevSearchResult,
-                    (KeyCode::Char('d'), _) if let Some(selected_pid) = selected_pid => {
-                        Transition::KillProcess(selected_pid)
-                    }
-                    (KeyCode::Char('d'), _) if let None = selected_pid => Transition::None,
-                    _ => Transition::None,
-                }
+            let dt = now.elapsed();
+            now = Instant::now();
+            tx.send(AppEvent::ProcessEffects(dt.into())).await?;
+            if dt < fps {
+                Timer::after(fps - dt).await;
             }
-            (Mode::Normal, AppEvent::Input(_)) => Transition::None,
-            (Mode::Search(_), AppEvent::Input(Event::Key(key_event))) => {
-                match (key_event.code, key_event.modifiers) {
-                    (KeyCode::Char(ch), KeyModifiers::NONE) => {
-                        Transition::SearchType(SearchTypeTransition::Type(ch))
-                    }
-                    (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
-                        Transition::SearchType(SearchTypeTransition::Type(ch.to_ascii_uppercase()))
-                    }
-                    (KeyCode::Delete | KeyCode::Backspace, _) => {
-                        Transition::SearchType(SearchTypeTransition::Delete)
-                    }
-                    (KeyCode::Esc | KeyCode::Enter, _) => Transition::CompleteSearch,
-                    _ => Transition::None,
-                }
-            }
-            (Mode::Search(_), AppEvent::Input(_)) => Transition::None,
         }
     }
-}
 
-impl StatefulWidget for &App {
-    type State = State;
+    #[builder]
+    fn draw(self: &App, frame: &mut Frame<'_>, state: &mut State) {
+        // frame.render_stateful_widget(self, frame.area(), state)
+        let area = frame.area();
+        let buf = frame.buffer_mut();
 
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State)
-    where
-        Self: Sized,
-    {
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(10), Constraint::Length(1)])
@@ -326,6 +317,7 @@ impl StatefulWidget for &App {
             Row::new(["PID", "USER", "CPU%", "MEM(B)", "MEM%", "Command"])
                 .style(Style::new().bg(Color::Green).fg(Color::Indexed(0))),
         )
+        .style(Style::new().bg(Color::Reset))
         .row_highlight_style(if !search_hooked {
             Style::new().bg(Color::Cyan).fg(Color::Black)
         } else {
@@ -368,7 +360,7 @@ impl StatefulWidget for &App {
                     .style(Style::new().bg(Color::Black))
                     .render(search_layout[0], buf);
 
-                let mut text_area = Paragraph::new(search_state.term.as_ref());
+                let text_area = Paragraph::new(search_state.term.as_ref());
                 // text_area.move_cursor(tui_textarea::CursorMove::End);
                 text_area.render(search_layout[1], buf);
             }
@@ -378,6 +370,90 @@ impl StatefulWidget for &App {
             .style(Style::new().bg(Color::Black))
             .right_aligned()
             .render(modeline_layout[1], buf);
+
+        let inner_table_layout = layout[0].offset(Offset { x: 0, y: 1 });
+        buf.render_effect(
+            &mut state.effects.table_slide_in,
+            inner_table_layout,
+            state.dt,
+        );
+        buf.render_effect(
+            &mut state.effects.modeline_slide_in_left,
+            modeline_layout[0],
+            state.dt,
+        );
+        buf.render_effect(
+            &mut state.effects.modeline_slide_in_right,
+            modeline_layout[1],
+            state.dt,
+        );
+    }
+}
+
+#[derive(Debug)]
+enum AppEvent {
+    ReloadConfig,
+    UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
+    Input(Event),
+    ProcessEffects(FxDuration),
+}
+
+impl Display for AppEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppEvent::ReloadConfig => write!(f, "ReloadConfig"),
+            AppEvent::UpdateProcess(_, _) => write!(f, "UpdateProcess"),
+            AppEvent::Input(event) => write!(f, "Input({:?})", event),
+            AppEvent::ProcessEffects(dt) => write!(f, "ProcessEffects({:?})", dt),
+        }
+    }
+}
+
+impl AppEvent {
+    fn into_transition(self, state: &State) -> Transition {
+        let selected_pid = match (&state.process_rows, state.process_table_state.selected()) {
+            (Some(process_rows), Some(idx)) => Some(process_rows[idx].2),
+            _ => None,
+        };
+        match (&state.mode, self) {
+            (_, AppEvent::ProcessEffects(dt)) => Transition::UpdateDt(dt),
+            (_, AppEvent::ReloadConfig) => Transition::None,
+            (_, AppEvent::UpdateProcess(process_tree, hash_map)) => {
+                Transition::UpdateProcess(process_tree, hash_map)
+            }
+            (Mode::Normal, AppEvent::Input(Event::Key(key_event))) => {
+                match (key_event.code, key_event.modifiers) {
+                    (KeyCode::Char('q'), _) => Transition::Exit,
+                    (KeyCode::Char('j'), _) => Transition::ScrollDown,
+                    (KeyCode::Char('k'), _) => Transition::ScrollUp,
+                    (KeyCode::Char('/'), _) => Transition::StartSearch,
+                    (KeyCode::Char('n'), _) => Transition::NextSearchResult,
+                    (KeyCode::Char('p'), _) => Transition::PrevSearchResult,
+                    (KeyCode::Char('d'), _) if let Some(selected_pid) = selected_pid => {
+                        Transition::KillProcess(selected_pid)
+                    }
+                    (KeyCode::Char('d'), _) if let None = selected_pid => Transition::None,
+                    _ => Transition::None,
+                }
+            }
+            (Mode::Normal, AppEvent::Input(_)) => Transition::None,
+            (Mode::Search(_), AppEvent::Input(Event::Key(key_event))) => {
+                match (key_event.code, key_event.modifiers) {
+                    (KeyCode::Char(ch), KeyModifiers::NONE) => {
+                        Transition::SearchType(SearchTypeTransition::Type(ch))
+                    }
+                    (KeyCode::Char(ch), KeyModifiers::SHIFT) => {
+                        Transition::SearchType(SearchTypeTransition::Type(ch.to_ascii_uppercase()))
+                    }
+                    (KeyCode::Delete | KeyCode::Backspace, _) => {
+                        Transition::SearchType(SearchTypeTransition::Delete)
+                    }
+                    (KeyCode::Esc | KeyCode::Enter, _) => Transition::CompleteSearch,
+                    _ => Transition::None,
+                }
+            }
+            (Mode::Search(_), AppEvent::Input(_)) => Transition::None,
+        }
     }
 }
 

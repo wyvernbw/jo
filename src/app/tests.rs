@@ -17,6 +17,13 @@ pub fn initialize() {
 }
 
 #[test]
+fn create_default_state() {
+    initialize();
+    let st = State::default();
+    tracing::info!(?st);
+}
+
+#[test]
 fn start_search_sets_mode_and_resets_old() {
     initialize();
     let st = State::default();
@@ -36,8 +43,10 @@ fn start_search_sets_mode_and_resets_old() {
 fn typing_search_builds_term_and_hooks() {
     initialize();
     let st = Transition::StartSearch.transition(State::default());
+    tracing::info!(?st);
     // type 'f'
     let st = Transition::SearchType(SearchTypeTransition::Type('f')).transition(st);
+    tracing::info!(?st);
     if let Mode::Search(ss) = &st.mode {
         assert_eq!(&*ss.term, "f");
         assert!(ss.hooked, "should be hooked after typing");
@@ -46,6 +55,7 @@ fn typing_search_builds_term_and_hooks() {
     }
     // type 'o'
     let st = Transition::SearchType(SearchTypeTransition::Type('o')).transition(st);
+    tracing::info!(?st);
     if let Mode::Search(ss) = &st.mode {
         assert_eq!(&*ss.term, "fo");
     } else {
