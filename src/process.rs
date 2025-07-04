@@ -150,18 +150,18 @@ impl ProcessTree {
     }
 }
 
-pub trait SkipPlaceholderRoot<'a> {
-    fn skip_placeholder_root(self) -> impl Iterator<Item = &'a Pid>;
-}
+// pub trait SkipPlaceholderRoot<'a> {
+//     fn skip_placeholder_root(self) -> impl Iterator<Item = &'a Pid>;
+// }
 
-impl<'a, I> SkipPlaceholderRoot<'a> for I
-where
-    I: Iterator<Item = NodeRef<'a, ProcessNode>>,
-{
-    fn skip_placeholder_root(self) -> impl Iterator<Item = &'a Pid> {
-        self.flat_map(|node| match node.value() {
-            ProcessNode::Root => None,
-            ProcessNode::Process(proc) => Some(proc),
-        })
-    }
-}
+// impl<'a, I> SkipPlaceholderRoot<'a> for I
+// where
+//     I: Iterator<Item = NodeRef<'a, ProcessNode>>,
+// {
+//     fn skip_placeholder_root(self) -> impl Iterator<Item = &'a Pid> {
+//         self.flat_map(|node| match node.value() {
+//             ProcessNode::Root => None,
+//             ProcessNode::Process(proc) => Some(proc),
+//         })
+//     }
+// }
