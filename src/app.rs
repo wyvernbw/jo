@@ -2,29 +2,52 @@ pub mod state;
 mod tests;
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
+use notify::{RecursiveMode, Watcher};
 use ratatui::{
     prelude::*,
     widgets::{Paragraph, Row, Table},
 };
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 use tui_textarea::TextArea;
 
 use ratatui::{DefaultTerminal, widgets::Widget};
-use smol::{Timer, channel::Sender, lock::Mutex, stream::StreamExt};
+use smol::{
+    Timer, channel::Sender, fs::DirEntry, io::AsyncReadExt, lock::Mutex, stream::StreamExt,
+};
 use sysinfo::{Pid, System, Users};
 
-use crate::app::state::Mode;
-use crate::app::state::SearchTypeTransition;
-use crate::app::state::State;
+use crate::{APP_DIR, CONFIG_DIR, app::state::SearchTypeTransition};
+use crate::{CONFIG_PATH, app::state::Mode};
+use crate::{THEMES_DIR, app::state::State};
 use crate::{
     app::state::Transition,
     default,
     process::{ProcessData, ProcessTree},
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Config {
+    theme: Arc<str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Theme {
+    name: Arc<str>,
+    header_color: Color,
+    highlight_color: Color,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     poll_rate: Duration,
+    themes: HashMap<Arc<str>, Theme>,
+    config: Config,
     system: Arc<Mutex<System>>,
     users: Arc<Mutex<Users>>,
 }
@@ -32,6 +55,8 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         App {
+            themes: default(),
+            config: default(),
             system: default(),
             users: default(),
             poll_rate: Duration::from_millis(1500),
@@ -40,6 +65,26 @@ impl Default for App {
 }
 
 impl App {
+    async fn config_hot_reload_task(tx: Sender<AppEvent>) -> color_eyre::Result<()> {
+        let event_channel = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(event_channel.0)?;
+
+        // Add a path to be watched. All files and directories at that path and
+        // below will be monitored for changes.
+        watcher.watch(&CONFIG_DIR, RecursiveMode::Recursive)?;
+        // Block forever, printing out events as they come in
+        loop {
+            if let Ok(Ok(event)) = event_channel.1.try_recv() {
+                match event.kind {
+                    notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
+                        tx.send(AppEvent::ReloadConfig).await?;
+                    }
+                    _ => {}
+                }
+            }
+            Timer::after(Duration::from_millis(1000)).await;
+        }
+    }
     async fn fetch_sysinfo_task(self: Self, tx: Sender<AppEvent>) -> color_eyre::Result<()> {
         loop {
             let mut system = self.system.lock().await;
@@ -81,16 +126,72 @@ impl App {
         }
     }
 
+    pub async fn load_config(self) -> color_eyre::Result<Self> {
+        let Some(config_path) = &*CONFIG_PATH else {
+            return Ok(self);
+        };
+        let mut file = smol::fs::File::open(config_path.as_path()).await?;
+        let mut config = String::default();
+        file.read_to_string(&mut config).await?;
+        let config: Config = ron::de::from_str(&config)?;
+        Ok(Self { config, ..self })
+    }
+
+    pub async fn load_themes(self) -> color_eyre::Result<Self> {
+        async fn process_theme_file(
+            entry: smol::io::Result<DirEntry>,
+        ) -> color_eyre::Result<Option<Theme>> {
+            let entry = entry?;
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                return Ok(None);
+            }
+            if !entry.file_name().to_string_lossy().ends_with(".ron") {
+                return Ok(None);
+            }
+            let mut file = smol::fs::File::open(entry.file_name()).await?;
+            let mut theme = String::default();
+            file.read_to_string(&mut theme).await?;
+            let theme: Theme = ron::de::from_str(&theme)?;
+            Ok(Some(theme))
+        }
+        let Some(themes_dir) = &*THEMES_DIR else {
+            return Ok(self);
+        };
+        let mut dir = smol::fs::read_dir(&themes_dir).await?;
+        let mut themes = HashMap::new();
+        while let Some(res) = dir.next().await {
+            match process_theme_file(res).await {
+                Ok(Some(theme)) => {
+                    themes.insert(theme.name.clone(), theme);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::error!(%err, "error processing theme");
+                }
+            }
+        }
+        Ok(Self { themes, ..self })
+    }
+
     pub async fn run(mut self, term: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let mut state = State::default();
         let event_channel = smol::channel::unbounded();
         smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone())).detach();
         smol::spawn(Self::input_task(event_channel.0.clone())).detach();
+        smol::spawn(Self::config_hot_reload_task(event_channel.0.clone())).detach();
 
         term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
         state.process_table_state.select_first();
         loop {
             let event = event_channel.1.recv().await?;
+            if let AppEvent::ReloadConfig = event {
+                self = self.load_themes().await?;
+                self = self.load_config().await?;
+                tracing::info!("reloaded config");
+                tracing::info!(?self.themes);
+                tracing::info!(?self.config.theme);
+            }
             let transition = event.into_transition(&state);
 
             self.run_side_effects(&transition).await;
@@ -105,6 +206,7 @@ impl App {
 }
 
 enum AppEvent {
+    ReloadConfig,
     UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
     Input(Event),
 }
@@ -116,6 +218,7 @@ impl AppEvent {
             _ => None,
         };
         match (&state.mode, self) {
+            (_, AppEvent::ReloadConfig) => Transition::None,
             (_, AppEvent::UpdateProcess(process_tree, hash_map)) => {
                 Transition::UpdateProcess(process_tree, hash_map)
             }

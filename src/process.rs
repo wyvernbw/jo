@@ -98,7 +98,6 @@ impl ProcessTree {
                 stack.push(pid);
             });
 
-        tracing::info!(initial_tree_map = ?tree_map);
         while let Some(value) = stack.pop() {
             stack.extend(
                 proc.iter()
@@ -112,7 +111,6 @@ impl ProcessTree {
             let Some(parent_pid) = process.parent() else {
                 continue;
             };
-            // tracing::debug!(?parent_pid, "fetching from tree map");
             let parent_id = tree_map
                 .get(&parent_pid)
                 .ok_or(eyre!("pid not in tree map"))?;

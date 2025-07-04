@@ -9,6 +9,7 @@ mod process;
 
 use std::{
     env::home_dir,
+    io::Write,
     path::PathBuf,
     str::FromStr,
     sync::{LazyLock, Mutex},
@@ -17,12 +18,23 @@ use std::{
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::app::App;
+use crate::app::{App, Config};
 
 static HOME_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| home_dir().expect("no home directory set up."));
 
 static APP_DIR: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".jo/"));
+
+static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+    let res = std::env::var("XDG_CONFIG_HOME")
+        .map(|str| PathBuf::from(str))
+        .unwrap_or_else(|_| HOME_DIR.join(".config"))
+        .join("jo/");
+    if let Err(err) = std::fs::create_dir_all(&res) {
+        tracing::error!(%err, "failed to create config dir");
+    };
+    res
+});
 
 static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let env_file = std::env::var("JO_LOG").map(|path_str| PathBuf::from_str(&path_str).unwrap());
@@ -32,6 +44,27 @@ static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
         tracing::warn!(%err, "unable to create logs directory: ")
     }
     path
+});
+
+static CONFIG_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let cfg = CONFIG_DIR.join("config.ron");
+    if !cfg.exists() {
+        let Ok(mut file) = std::fs::File::create(&cfg) else {
+            return None;
+        };
+        let buf =
+            ron::ser::to_string(&Config::default()).expect("failed to serialize default config.");
+        file.write_all(buf.as_bytes());
+    }
+    Some(cfg)
+});
+static THEMES_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let res = CONFIG_DIR.join("themes/");
+    if let Err(err) = std::fs::create_dir_all(&res) {
+        tracing::error!(%err, "failed to create themes dir");
+        return None;
+    };
+    Some(res)
 });
 
 #[cfg(feature = "dhat-heap")]
@@ -58,6 +91,13 @@ fn main() -> color_eyre::Result<()> {
         .finish()
         .init();
     tracing::info!("jo started");
+
+    LazyLock::force(&THEMES_DIR);
+    LazyLock::force(&CONFIG_PATH);
+
+    tracing::info!(?THEMES_DIR);
+    tracing::info!(?CONFIG_PATH);
+    tracing::info!(?LOG_PATH);
 
     let mut terminal = ratatui::init();
     let app = App::default();
