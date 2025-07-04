@@ -14,13 +14,12 @@ use std::{
     sync::{Arc, mpsc},
     time::Duration,
 };
-use tui_textarea::TextArea;
 
 use ratatui::{DefaultTerminal, widgets::Widget};
 use smol::{
     Timer, channel::Sender, fs::DirEntry, io::AsyncReadExt, lock::Mutex, stream::StreamExt,
 };
-use sysinfo::{Pid, System, Users};
+use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System, Users};
 
 use crate::{APP_DIR, CONFIG_DIR, app::state::SearchTypeTransition};
 use crate::{CONFIG_PATH, app::state::Mode};
@@ -89,8 +88,19 @@ impl App {
         loop {
             let mut system = self.system.lock().await;
             let mut users = self.users.lock().await;
-            system.refresh_all();
             users.refresh();
+            system.refresh_specifics(
+                RefreshKind::nothing()
+                    .with_memory(MemoryRefreshKind::nothing().with_ram()) // if you need it
+                    .with_processes(
+                        ProcessRefreshKind::nothing()
+                            .with_cpu()
+                            .with_user(sysinfo::UpdateKind::Always)
+                            .with_memory()
+                            .with_cmd(sysinfo::UpdateKind::Always)
+                            .with_tasks(),
+                    ),
+            );
             let proc = system.processes();
             let data = proc
                 .iter()
@@ -177,9 +187,9 @@ impl App {
     pub async fn run(mut self, term: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let mut state = State::default();
         let event_channel = smol::channel::unbounded();
-        smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone())).detach();
-        smol::spawn(Self::input_task(event_channel.0.clone())).detach();
-        smol::spawn(Self::config_hot_reload_task(event_channel.0.clone())).detach();
+        let _handle_1 = smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone()));
+        let _handle_2 = smol::spawn(Self::input_task(event_channel.0.clone()));
+        let _handle_3 = smol::spawn(Self::config_hot_reload_task(event_channel.0.clone()));
 
         term.draw(|frame| frame.render_stateful_widget(&self, frame.area(), &mut state))?;
         state.process_table_state.select_first();
@@ -337,7 +347,7 @@ impl StatefulWidget for &App {
         let (selected_pid, selected_name) = match state.process_table_state.selected() {
             Some(idx) => (
                 Cow::Owned(format!("@ {}", proc_data[idx].2.pid,)),
-                Cow::Owned(format!("{}", proc_data[idx].2.name.display())),
+                Cow::Owned(format!("{}", proc_data[idx].2.name)),
             ),
             None => (Cow::Borrowed(""), Cow::Borrowed("")),
         };
@@ -358,8 +368,8 @@ impl StatefulWidget for &App {
                     .style(Style::new().bg(Color::Black))
                     .render(search_layout[0], buf);
 
-                let mut text_area = TextArea::new(vec![search_state.term.to_string()]);
-                text_area.move_cursor(tui_textarea::CursorMove::End);
+                let mut text_area = Paragraph::new(search_state.term.as_ref());
+                // text_area.move_cursor(tui_textarea::CursorMove::End);
                 text_area.render(search_layout[1], buf);
             }
         };

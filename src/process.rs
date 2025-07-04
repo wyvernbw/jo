@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, ffi::OsString};
+use std::{cmp::Ordering, collections::HashMap, ffi::OsString, sync::Arc};
 
 use color_eyre::eyre::eyre;
 use ego_tree::{NodeId, NodeRef, Tree};
@@ -6,8 +6,8 @@ use sysinfo::{Pid, Process, System, Users};
 
 #[derive(Debug, Clone)]
 pub struct ProcessData {
-    pub user: String,
-    pub name: OsString,
+    pub user: Arc<str>,
+    pub name: Arc<str>,
     pub pid: Pid,
     pub cpu_usage: f16,
     pub memory_percent: f16,
@@ -25,8 +25,8 @@ impl ProcessData {
         let user = value.user_id();
         let user = user
             .and_then(|id| users.get_user_by_id(id))
-            .map(|user| user.name().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map(|user| user.name())
+            .unwrap_or("unknown");
         let cpu_usage = value.cpu_usage() as f64 / (cpu_count as f64);
         let cpu_usage = cpu_usage as f16;
         let memory_usage = value.memory();
@@ -36,6 +36,8 @@ impl ProcessData {
             memory_percent as f16
         };
         let pid = value.pid();
+        let name = Arc::from(name.to_string_lossy());
+        let user = Arc::from(user);
         ProcessData {
             pid,
             name,

@@ -62,7 +62,6 @@ impl State {
                 proc.pid.as_u32().to_string() == search_state.term.as_ref() || {
                     proc.name
                         .to_ascii_lowercase()
-                        .to_string_lossy()
                         .contains(search_state.term.as_ref())
                         && search_state.term.len() > 0
                 }
@@ -282,18 +281,18 @@ impl ProcessView {
                     "{}{} {}",
                     " │ ".repeat(depth.saturating_sub(2)),
                     prefix,
-                    proc.name.display()
+                    proc.name
                 )),
             ]),
             ProcessView::Flat => Row::new([
                 Cell::new(proc.pid.to_string()),
-                Cell::new(proc.user.to_string()).style(grey_out(proc.user == "root")),
+                Cell::new(proc.user.to_string()).style(grey_out(proc.user.as_ref() == "root")),
                 Cell::new(format!("{:.2}%", proc.cpu_usage)).style(grey_out(proc.cpu_usage < 0.01)),
                 Cell::new(ByteSize::b(proc.memory_usage).display().iec().to_string())
                     .style(grey_out(proc.memory_usage == 0)),
                 Cell::new(format!("{:.2}%", proc.memory_percent))
                     .style(grey_out(proc.memory_percent < 0.01)),
-                Cell::new(format!("{}", proc.name.display())).style(
+                Cell::new(format!("{}", proc.name)).style(
                     if search_matches.get(idx).unwrap_or(false) {
                         Style::new().fg(Color::Green)
                     } else {
