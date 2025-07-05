@@ -9,10 +9,10 @@ use ratatui::{
     widgets::{Cell, Row, TableState},
 };
 use sysinfo::Pid;
-use tachyonfx::{Duration, Effect, EffectRenderer, EffectTimer, Shader, fx};
+use tachyonfx::{Duration, Effect, EffectRenderer, EffectTimer, Interpolation, Shader, fx};
 
 use crate::{
-    app::grey_out,
+    app::{SystemInformation, grey_out},
     process::{ProcessData, ProcessNode, ProcessTree},
 };
 
@@ -26,9 +26,8 @@ pub struct State {
     pub mode: Mode,
     pub old_search_state: Option<SearchState>,
     pub search_matches: BitVec,
-    pub process_tree: ProcessTree,
+    pub sysinfo: SystemInformation,
     pub process_rows: Option<Vec<ProcessRow>>,
-    pub process_data: HashMap<Pid, ProcessData>,
     pub process_table_state: TableState,
     pub effects: TuiEffects,
     pub dt: Duration,
@@ -63,7 +62,7 @@ impl State {
         let matches = process_rows
             .iter()
             .enumerate()
-            .flat_map(|(idx, (_, _, pid))| Some(idx).zip(self.process_data.get(pid)))
+            .flat_map(|(idx, (_, _, pid))| Some(idx).zip(self.sysinfo.process_data.get(pid)))
             .filter(|&(_, proc)| {
                 proc.pid.as_u32().to_string() == search_state.term.as_ref() || {
                     proc.name
@@ -129,7 +128,7 @@ impl State {
     pub fn prepare(mut self) -> State {
         match self.process_view {
             ProcessView::Tree => {
-                self.process_tree.deep_sort_by(|a, b| -> Ordering {
+                self.sysinfo.process_tree.deep_sort_by(|a, b| -> Ordering {
                     match (a.value(), b.value()) {
                         (ProcessNode::Root, ProcessNode::Root) => {
                             unreachable!("only one root for the tree")
@@ -137,8 +136,11 @@ impl State {
                         (ProcessNode::Root, ProcessNode::Process(_)) => Ordering::Less,
                         (ProcessNode::Process(_), ProcessNode::Root) => Ordering::Greater,
                         (ProcessNode::Process(a), ProcessNode::Process(b)) => {
-                            if let Some((a, b)) =
-                                self.process_data.get(a).zip(self.process_data.get(b))
+                            if let Some((a, b)) = self
+                                .sysinfo
+                                .process_data
+                                .get(a)
+                                .zip(self.sysinfo.process_data.get(b))
                             {
                                 self.sort_mode.call((a, b))
                             } else {
@@ -153,6 +155,7 @@ impl State {
 
         let mut depth = 0usize;
         let mut proc_data = self
+            .sysinfo
             .process_tree
             .0
             .root()
@@ -175,9 +178,11 @@ impl State {
             })
             .flat_map(|(depth, prefix, node)| match node.value() {
                 ProcessNode::Root => None,
-                ProcessNode::Process(proc) => {
-                    Some((depth, prefix, self.process_data.get(proc).unwrap().clone()))
-                }
+                ProcessNode::Process(proc) => Some((
+                    depth,
+                    prefix,
+                    self.sysinfo.process_data.get(proc).unwrap().clone(),
+                )),
             })
             .collect::<Vec<_>>();
 
@@ -333,7 +338,7 @@ pub enum Transition {
     None,
     UpdateDt(Duration),
     #[strum(to_string = "UpdateProcess")]
-    UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
+    UpdateSysInfo(SystemInformation),
     Exit,
     ScrollUp,
     ScrollDown,
@@ -360,12 +365,8 @@ impl Transition {
                 ..state
             },
             (_, Transition::UpdateDt(dt)) => State { dt, ..state },
-            (_, Transition::UpdateProcess(tree, data)) => {
-                let new_state = State {
-                    process_tree: tree,
-                    process_data: data,
-                    ..state
-                };
+            (_, Transition::UpdateSysInfo(sysinfo)) => {
+                let new_state = State { sysinfo, ..state };
                 new_state.prepare().refresh_search_if_hooked()
             }
             (_, Transition::ScrollUp) => {
@@ -455,6 +456,7 @@ impl Transition {
 pub struct TuiEffect {
     pub effect: Effect,
     started: bool,
+    finished: bool,
 }
 
 impl TuiEffect {
@@ -462,22 +464,27 @@ impl TuiEffect {
         Self {
             effect,
             started: false,
+            finished: false,
         }
     }
     pub fn started(&self) -> bool {
         self.started
     }
     pub fn finished(&self) -> bool {
-        !self.effect.running()
+        self.finished
     }
     pub fn update(&mut self, buf: &mut Buffer, area: Rect, dt: Duration) {
         if !self.started() {
             return;
         }
         if self.finished() {
+            self.started = false;
             return;
         }
         buf.render_effect(&mut self.effect, area, dt);
+        if self.started() {
+            self.finished = !self.effect.running();
+        }
     }
     pub fn start(&mut self) -> &mut Self {
         self.started = true;
@@ -485,8 +492,24 @@ impl TuiEffect {
         tracing::info!("started effect");
         self
     }
+    pub fn stop(&mut self) -> &mut Self {
+        self.started = false;
+        tracing::info!("stopped effect");
+        self
+    }
     pub fn running(&self) -> bool {
         self.started() && !self.finished()
+    }
+    pub fn set_running(&mut self, value: bool) -> &mut Self {
+        match (self.finished(), value) {
+            (true, true) => self.start(),
+            (false, true) => {
+                self.started = true;
+                self
+            }
+            (true, false) => self,
+            (false, false) => self.stop(),
+        }
     }
 }
 
@@ -561,6 +584,21 @@ impl Default for KillEffect {
         )
         .into();
         Self(effect)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HighUsagePulseEffect(pub TuiEffect);
+
+impl Default for HighUsagePulseEffect {
+    fn default() -> Self {
+        let timer = EffectTimer::from_ms(5000, Interpolation::Linear);
+        let effect = fx::sequence(&[
+            fx::fade_from_fg(Color::Indexed(3), timer.clone()),
+            fx::fade_to_fg(Color::Indexed(3), timer),
+        ]);
+        let effect = fx::repeating(effect);
+        HighUsagePulseEffect(effect.into())
     }
 }
 

@@ -1,13 +1,15 @@
 pub mod state;
 mod tests;
 
+use bon::{Builder, bon, builder};
 use chrono::format::DelayedFormat;
-use color_eyre::SectionExt;
+use color_eyre::{SectionExt, owo_colors::OwoColorize};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use notify::{RecursiveMode, Watcher};
 use ratatui::{
     layout::Offset,
     prelude::*,
+    style::Styled,
     widgets::{Paragraph, Row, Table},
 };
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fmt::Display,
+    ops::Add,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -29,7 +32,9 @@ use smol::{
     lock::Mutex,
     stream::StreamExt,
 };
-use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System, Users};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, RefreshKind, System, Users,
+};
 
 use crate::{CONFIG_DIR, app::state::SearchTypeTransition};
 use crate::{CONFIG_PATH, app::state::Mode};
@@ -114,7 +119,8 @@ impl App {
             users.refresh();
             system.refresh_specifics(
                 RefreshKind::nothing()
-                    .with_memory(MemoryRefreshKind::nothing().with_ram()) // if you need it
+                    .with_memory(MemoryRefreshKind::nothing().with_ram())
+                    .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
                     .with_processes(
                         ProcessRefreshKind::nothing()
                             .with_cpu()
@@ -130,10 +136,24 @@ impl App {
                 .map(|(pid, proc)| (*pid, ProcessData::from_process(proc, &system, &users)))
                 .collect();
             let proc = ProcessTree::try_new().proc(proc).call();
+            let mem = system.used_memory() as f16 / system.total_memory() as f16;
+            let cpu_usage = system
+                .cpus()
+                .iter()
+                .map(|cpu| cpu.cpu_usage() as f16 / 100.0)
+                .collect();
             drop(system);
             drop(users);
             if let Ok(proc) = proc {
-                tx.send(AppEvent::UpdateProcess(proc, data)).await?;
+                tx.send(AppEvent::UpdateProcess(
+                    SystemInformation::builder()
+                        .process_tree(proc)
+                        .process_data(data)
+                        .mem_usage(mem)
+                        .cpu_usage(cpu_usage)
+                        .build(),
+                ))
+                .await?;
             }
             Timer::after(self.poll_rate).await;
         }
@@ -220,12 +240,13 @@ impl App {
         let _handle_1 = smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone()));
         let _handle_2 = smol::spawn(Self::input_task(event_channel.0.clone()));
         let _handle_3 = smol::spawn(Self::config_hot_reload_task(event_channel.0.clone()));
-        if self.config.animations {
-            smol::spawn(Self::effects_task(
+        let _handle_4 = if self.config.animations {
+            Some(smol::spawn(Self::effects_task(
                 event_channel.0.clone(),
                 shader_event_channel.1,
-            ))
-            .detach();
+            )))
+        } else {
+            None
         };
 
         state.effects.table_slide_in.0.start();
@@ -307,7 +328,7 @@ impl App {
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(2), Constraint::Fill(6)])
+            .constraints([Constraint::Max(10), Constraint::Fill(6)])
             .split(area);
 
         let bottom_layout = Layout::default()
@@ -326,6 +347,68 @@ impl App {
             .constraints([Constraint::Max(8), Constraint::Min(1)])
             .split(modeline_layout[0]);
 
+        let cpu_count = state.sysinfo.cpu_usage.len();
+        let cpu_column_width = 32;
+        let cpu_margin = 1;
+        let cpu_per_column = layout[0].height.saturating_sub(cpu_margin * 2).min(8) as usize;
+        let cpu_columns = cpu_count / cpu_per_column
+            + if cpu_count % cpu_per_column != 0 {
+                1
+            } else {
+                0
+            };
+        let top_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(vec![Constraint::Max(cpu_column_width); cpu_columns])
+            .spacing(2)
+            .margin(cpu_margin)
+            .split(layout[0]);
+        for ((col_idx, cpu_usage), col_rect) in state
+            .sysinfo
+            .cpu_usage
+            .chunks(cpu_per_column)
+            .enumerate()
+            .zip(top_layout.iter())
+        {
+            let lines = cpu_usage.iter().enumerate().map(|(idx, cpu)| {
+                let max_ch = col_rect.width as usize - 2 - 3;
+                let percentage = cpu * 100.0;
+                let percentage = format!("{percentage:.2}%");
+                let ch_count = cpu.clamp(0.0, 1.0) * max_ch as f16;
+                let ch_count = (ch_count as usize).clamp(0, max_ch - percentage.len());
+                let empty_count = max_ch
+                    .saturating_sub(ch_count)
+                    .saturating_sub(percentage.len());
+                let cpu_idx = idx + col_idx * cpu_per_column;
+                let line = Line::from(vec![
+                    Span::from(format!("{cpu_idx:>2} ")),
+                    Span::from("[").style(Style::new().bold()),
+                    Span::from(format!(
+                        "{}{}",
+                        "|".repeat(ch_count),
+                        " ".repeat(empty_count)
+                    ))
+                    .style(Style::new().red()),
+                    Span::from(percentage).style(Style::new().bold().fg(match *cpu {
+                        0.0..0.25 => Color::DarkGray,
+                        0.25..0.5 => Color::Green,
+                        0.5..0.75 => Color::Red,
+                        0.75.. => Color::White,
+                        _ => Color::DarkGray,
+                    })),
+                    Span::from("]").style(Style::new().bold()),
+                ]);
+                let mut percentage_area = col_rect.clone().offset(Offset {
+                    x: 0,
+                    y: idx as i32,
+                });
+                percentage_area.height = 1;
+                line
+            });
+            let text = Text::from_iter(lines);
+            frame.render_widget(text, *col_rect);
+        }
+
         let selected_idx = state.process_table_state.selected().unwrap_or_default();
         let term_height = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(64) as usize;
         let proc_data = state
@@ -336,7 +419,7 @@ impl App {
             .cloned()
             .take(term_height + selected_idx)
             .flat_map(|(depth, prefix, proc)| {
-                Some((depth, prefix)).zip(state.process_data.get(&proc))
+                Some((depth, prefix)).zip(state.sysinfo.process_data.get(&proc))
             })
             .map(|((depth, prefix), proc)| (depth, prefix, proc))
             .collect::<Vec<_>>();
@@ -385,7 +468,7 @@ impl App {
             ],
         )
         .header(
-            Row::new(["PID", "USER", "CPU%", "MEM(B)", "MEM%", "Command"])
+            Row::new([" PID", "USER", "CPU%", "MEM(B)", "MEM%", "Command"])
                 .style(Style::new().bg(theme.header_color).fg(Color::Indexed(0))),
         )
         .style(Style::new().bg(Color::Reset))
@@ -400,7 +483,7 @@ impl App {
 
         let (selected_pid, selected_name) = match state.process_table_state.selected() {
             Some(idx) => (
-                Cow::Owned(format!("@ {}", proc_data[idx].2.pid,)),
+                Cow::Owned(format!("{}", proc_data[idx].2.pid)),
                 Cow::Owned(format!("{}", proc_data[idx].2.name)),
             ),
             None => (Cow::Borrowed(""), Cow::Borrowed("")),
@@ -408,9 +491,16 @@ impl App {
 
         match &state.mode {
             Mode::Normal => {
-                Paragraph::new(format!(" {} {}", state.mode, selected_pid))
-                    .style(Style::new().bg(Color::Black))
-                    .render(modeline_layout[0], frame.buffer_mut());
+                Line::from(vec![
+                    Span::from(format!(" {}", state.mode)),
+                    " @ ".into(),
+                    Span::from(selected_pid).set_style(if search_hooked {
+                        Style::new().bold()
+                    } else {
+                        Style::new()
+                    }),
+                ])
+                .render(modeline_layout[0], frame.buffer_mut());
             }
             Mode::Search(search_state) => {
                 Paragraph::new("SEARCH: ")
@@ -468,16 +558,24 @@ impl App {
 #[derive(Debug)]
 enum AppEvent {
     ReloadConfig,
-    UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
+    UpdateProcess(SystemInformation),
     Input(Event),
     ProcessEffects(FxDuration),
+}
+
+#[derive(Debug, Builder, Default)]
+pub struct SystemInformation {
+    pub process_tree: ProcessTree,
+    pub process_data: HashMap<Pid, ProcessData>,
+    pub mem_usage: f16,
+    pub cpu_usage: Vec<f16>,
 }
 
 impl Display for AppEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AppEvent::ReloadConfig => write!(f, "ReloadConfig"),
-            AppEvent::UpdateProcess(_, _) => write!(f, "UpdateProcess"),
+            AppEvent::UpdateProcess(_) => write!(f, "UpdateProcess"),
             AppEvent::Input(event) => write!(f, "Input({:?})", event),
             AppEvent::ProcessEffects(dt) => write!(f, "ProcessEffects({:?})", dt),
         }
@@ -493,8 +591,8 @@ impl AppEvent {
         match (&state.mode, self) {
             (_, AppEvent::ProcessEffects(dt)) => Transition::UpdateDt(dt),
             (_, AppEvent::ReloadConfig) => Transition::None,
-            (_, AppEvent::UpdateProcess(process_tree, hash_map)) => {
-                Transition::UpdateProcess(process_tree, hash_map)
+            (_, AppEvent::UpdateProcess(system_information)) => {
+                Transition::UpdateSysInfo(system_information)
             }
             (Mode::Normal, AppEvent::Input(Event::Key(key_event))) => {
                 match (key_event.code, key_event.modifiers) {
