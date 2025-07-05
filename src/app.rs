@@ -1,6 +1,7 @@
 pub mod state;
 mod tests;
 
+use chrono::format::DelayedFormat;
 use color_eyre::SectionExt;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use notify::{RecursiveMode, Watcher};
@@ -53,10 +54,20 @@ pub struct Theme {
     highlight_color: Color,
 }
 
+impl Default for Theme {
+    fn default() -> Self {
+        Theme {
+            name: "default".into(),
+            header_color: Color::Green,
+            highlight_color: Color::White,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     poll_rate: Duration,
-    themes: HashMap<Arc<str>, Theme>,
+    themes: HashMap<Arc<str>, Arc<Theme>>,
     config: Config,
     system: Arc<Mutex<System>>,
     users: Arc<Mutex<Users>>,
@@ -185,7 +196,7 @@ impl App {
         while let Some(res) = dir.next().await {
             match process_theme_file(res).await {
                 Ok(Some(theme)) => {
-                    themes.insert(theme.name.clone(), theme);
+                    themes.insert(theme.name.clone(), Arc::new(theme));
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -222,6 +233,14 @@ impl App {
         state.effects.modeline_slide_in_right.0.start();
 
         state.process_table_state.select_first();
+
+        let default_theme = Theme::default();
+        let mut current_theme = self
+            .themes
+            .get(&self.config.theme)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(default_theme));
+
         loop {
             if state.effects.running() && self.config.animations {
                 shader_event_channel.0.send(()).await?;
@@ -234,6 +253,11 @@ impl App {
                 tracing::info!("reloaded config");
                 tracing::info!(?self.themes);
                 tracing::info!(?self.config.theme);
+                if let Some(theme) = self.themes.get(&self.config.theme) {
+                    current_theme = theme.clone();
+                } else {
+                    tracing::warn!(?self.config.theme, "theme not found.")
+                }
             }
             let process_effects = matches!(event, AppEvent::ProcessEffects(_));
             let transition = event.into_transition(&state);
@@ -250,6 +274,7 @@ impl App {
                     .frame(frame)
                     .state(&mut state)
                     .process_effects(process_effects)
+                    .theme(&current_theme)
                     .call()
             })?;
         }
@@ -270,21 +295,32 @@ impl App {
     }
 
     #[builder]
-    fn draw(self: &App, frame: &mut Frame<'_>, state: &mut State, process_effects: bool) {
+    fn draw(
+        self: &App,
+        frame: &mut Frame<'_>,
+        state: &mut State,
+        process_effects: bool,
+        theme: &Theme,
+    ) {
         // frame.render_stateful_widget(self, frame.area(), state)
         let area = frame.area();
         let buf = frame.buffer_mut();
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(2), Constraint::Fill(6)])
+            .split(area);
+
+        let bottom_layout = Layout::default()
+            .direction(Direction::Vertical)
             .constraints([Constraint::Min(10), Constraint::Length(1)])
             .spacing(1)
-            .split(area);
+            .split(layout[1]);
 
         let modeline_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(8), Constraint::Min(8)])
-            .split(layout[1]);
+            .split(bottom_layout[1]);
 
         let search_layout = Layout::default()
             .direction(Direction::Horizontal)
@@ -335,7 +371,7 @@ impl App {
         let table_highlight_style = match (search_hooked, killed_idx == Some(selected_idx)) {
             (true, false) => Style::new().on_yellow().black(),
             (_, true) => Style::new().on_black().dark_gray(),
-            (false, false) => Style::new().on_cyan().black(),
+            (false, false) => Style::new().bg(theme.highlight_color).black(),
         };
 
         let table = Table::new(
@@ -351,12 +387,12 @@ impl App {
         )
         .header(
             Row::new(["PID", "USER", "CPU%", "MEM(B)", "MEM%", "Command"])
-                .style(Style::new().bg(Color::Green).fg(Color::Indexed(0))),
+                .style(Style::new().bg(theme.header_color).fg(Color::Indexed(0))),
         )
         .style(Style::new().bg(Color::Reset))
         .row_highlight_style(table_highlight_style);
 
-        StatefulWidget::render(table, layout[0], buf, &mut state.process_table_state);
+        StatefulWidget::render(table, bottom_layout[0], buf, &mut state.process_table_state);
 
         let (selected_pid, selected_name) = match state.process_table_state.selected() {
             Some(idx) => (
@@ -389,7 +425,7 @@ impl App {
             .render(modeline_layout[1], buf);
 
         if process_effects {
-            let inner_table_layout = layout[0].offset(Offset { x: 0, y: 1 });
+            let inner_table_layout = bottom_layout[0].offset(Offset { x: 0, y: 1 });
             state
                 .effects
                 .table_slide_in
