@@ -3,11 +3,13 @@ use std::{cmp::Ordering, collections::HashMap, fmt::Display, sync::Arc};
 use bit_vec::BitVec;
 use bytesize::ByteSize;
 use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
     style::{Color, Style},
     widgets::{Cell, Row, TableState},
 };
 use sysinfo::Pid;
-use tachyonfx::{Duration, Effect, EffectTimer, Shader, fx};
+use tachyonfx::{Duration, Effect, EffectRenderer, EffectTimer, Shader, fx};
 
 use crate::{
     app::grey_out,
@@ -30,6 +32,7 @@ pub struct State {
     pub process_table_state: TableState,
     pub effects: TuiEffects,
     pub dt: Duration,
+    pub last_killed_pid: Option<Pid>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -325,10 +328,11 @@ impl Display for TreePrefix {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, strum::Display)]
 pub enum Transition {
     None,
     UpdateDt(Duration),
+    #[strum(to_string = "UpdateProcess")]
     UpdateProcess(ProcessTree, HashMap<Pid, ProcessData>),
     Exit,
     ScrollUp,
@@ -382,7 +386,12 @@ impl Transition {
                 }
                 .unhook_search()
             }
-            (_, Transition::KillProcess(_)) => state.refresh_search(),
+            (_, Transition::KillProcess(pid)) => {
+                let mut state = state.refresh_search();
+                state.last_killed_pid = Some(pid);
+                state.effects.kill_effect.0.start();
+                state.unhook_search()
+            }
             (Mode::Normal, Transition::SearchType(_)) => unreachable!(),
             (Mode::Search(search_state), Transition::SearchType(search_type_transition)) => {
                 let new_term = match search_type_transition {
@@ -443,87 +452,141 @@ impl Transition {
 }
 
 #[derive(Debug, Clone)]
-pub struct TuiEffects {
-    pub table_slide_in: Effect,
-    pub modeline_slide_in_left: Effect,
-    pub modeline_slide_in_right: Effect,
-    pub state: TuiEffectState,
+pub struct TuiEffect {
+    pub effect: Effect,
+    started: bool,
 }
 
-const EFFECT_COUNT: usize = 3;
-const EFFECT_MASK: u32 = (1 << EFFECT_COUNT) - 1;
-
-impl TuiEffects {
-    pub fn new() -> Self {
-        let table_slide_in_ms = 500;
+impl TuiEffect {
+    pub fn new(effect: Effect) -> Self {
         Self {
-            table_slide_in: fx::slide_in(
-                tachyonfx::Motion::UpToDown,
-                12,
-                0,
-                Color::Reset,
-                EffectTimer::from_ms(table_slide_in_ms, tachyonfx::Interpolation::CubicInOut),
-            ),
-            modeline_slide_in_left: fx::slide_in(
-                tachyonfx::Motion::RightToLeft,
-                12,
-                0,
-                Color::White,
-                EffectTimer::from_ms(500, tachyonfx::Interpolation::CubicInOut),
-            ),
-            modeline_slide_in_right: fx::slide_in(
-                tachyonfx::Motion::LeftToRight,
-                12,
-                0,
-                Color::White,
-                EffectTimer::from_ms(600, tachyonfx::Interpolation::CubicInOut),
-            ),
-            state: TuiEffectState::default(),
+            effect,
+            started: false,
         }
     }
-    pub fn update(mut self) -> Self {
-        match &mut self {
-            TuiEffects {
-                table_slide_in,
-                modeline_slide_in_left,
-                modeline_slide_in_right,
-                state,
-            } => {
-                state.set_effect_state(0, &table_slide_in);
-                state.set_effect_state(1, &modeline_slide_in_left);
-                state.set_effect_state(2, &modeline_slide_in_right);
-            }
-        };
+    pub fn started(&self) -> bool {
+        self.started
+    }
+    pub fn finished(&self) -> bool {
+        !self.effect.running()
+    }
+    pub fn update(&mut self, buf: &mut Buffer, area: Rect, dt: Duration) {
+        if !self.started() {
+            return;
+        }
+        if self.finished() {
+            return;
+        }
+        buf.render_effect(&mut self.effect, area, dt);
+    }
+    pub fn start(&mut self) -> &mut Self {
+        self.started = true;
+        self.effect.reset();
+        tracing::info!("started effect");
         self
+    }
+    pub fn running(&self) -> bool {
+        self.started() && !self.finished()
     }
 }
 
-impl Default for TuiEffects {
-    fn default() -> Self {
-        TuiEffects::new()
+impl From<Effect> for TuiEffect {
+    fn from(effect: Effect) -> Self {
+        Self::new(effect)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct TuiEffectState(BitVec);
+pub struct TableSlideInEffect(pub TuiEffect);
 
-impl TuiEffectState {
-    pub fn new() -> Self {
-        TuiEffectState(BitVec::from_elem(32, false))
-    }
-    pub fn all_done(&self) -> bool {
-        let [value] = *self.0.storage() else {
-            panic!("what the fuck")
-        };
-        value & EFFECT_MASK == 1
-    }
-    pub fn set_effect_state(&mut self, idx: usize, effect: &Effect) {
-        self.0.set(idx, !effect.running());
+impl Default for TableSlideInEffect {
+    fn default() -> Self {
+        let effect = fx::slide_in(
+            tachyonfx::Motion::UpToDown,
+            12,
+            0,
+            Color::Reset,
+            EffectTimer::from_ms(500, tachyonfx::Interpolation::CubicInOut),
+        )
+        .into();
+        Self(effect)
     }
 }
 
-impl Default for TuiEffectState {
+#[derive(Debug, Clone)]
+pub struct ModelineSlideInLeftEffect(pub TuiEffect);
+
+impl Default for ModelineSlideInLeftEffect {
     fn default() -> Self {
-        TuiEffectState::new()
+        let effect = fx::slide_in(
+            tachyonfx::Motion::RightToLeft,
+            12,
+            0,
+            Color::White,
+            EffectTimer::from_ms(600, tachyonfx::Interpolation::CubicInOut),
+        )
+        .into();
+        Self(effect)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelineSlideInRightEffect(pub TuiEffect);
+
+impl Default for ModelineSlideInRightEffect {
+    fn default() -> Self {
+        let effect = fx::slide_in(
+            tachyonfx::Motion::LeftToRight,
+            12,
+            0,
+            Color::White,
+            EffectTimer::from_ms(600, tachyonfx::Interpolation::CubicInOut),
+        )
+        .into();
+        Self(effect)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KillEffect(pub TuiEffect);
+
+impl Default for KillEffect {
+    fn default() -> Self {
+        let effect = fx::slide_in(
+            tachyonfx::Motion::LeftToRight,
+            12,
+            0,
+            Color::White,
+            EffectTimer::from_ms(600, tachyonfx::Interpolation::CubicInOut),
+        )
+        .into();
+        Self(effect)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TuiEffects {
+    pub table_slide_in: TableSlideInEffect,
+    pub modeline_slide_in_left: ModelineSlideInLeftEffect,
+    pub modeline_slide_in_right: ModelineSlideInRightEffect,
+    pub kill_effect: KillEffect,
+}
+
+impl TuiEffects {
+    pub fn running(&self) -> bool {
+        let effects = match &self {
+            TuiEffects {
+                table_slide_in,
+                modeline_slide_in_left,
+                modeline_slide_in_right,
+                kill_effect,
+            } => [
+                &table_slide_in.0,
+                &modeline_slide_in_left.0,
+                &modeline_slide_in_right.0,
+                &kill_effect.0,
+            ],
+        };
+        effects.iter().any(|effect| effect.running())
     }
 }

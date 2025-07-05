@@ -18,6 +18,7 @@ ratatui = { version = "0.29.0", features = ["serde"] }
 ron = "0.10.1"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 smol = "2.0.2"
+strum = { version = "0.27.1", features = ["derive"] }
 sysinfo = "0.35.2"
 tachyonfx = "0.15.0"
 tracing = "0.1.41"
