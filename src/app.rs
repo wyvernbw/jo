@@ -304,7 +304,6 @@ impl App {
     ) {
         // frame.render_stateful_widget(self, frame.area(), state)
         let area = frame.area();
-        let buf = frame.buffer_mut();
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -392,7 +391,12 @@ impl App {
         .style(Style::new().bg(Color::Reset))
         .row_highlight_style(table_highlight_style);
 
-        StatefulWidget::render(table, bottom_layout[0], buf, &mut state.process_table_state);
+        StatefulWidget::render(
+            table,
+            bottom_layout[0],
+            frame.buffer_mut(),
+            &mut state.process_table_state,
+        );
 
         let (selected_pid, selected_name) = match state.process_table_state.selected() {
             Some(idx) => (
@@ -406,23 +410,28 @@ impl App {
             Mode::Normal => {
                 Paragraph::new(format!(" {} {}", state.mode, selected_pid))
                     .style(Style::new().bg(Color::Black))
-                    .render(modeline_layout[0], buf);
+                    .render(modeline_layout[0], frame.buffer_mut());
             }
             Mode::Search(search_state) => {
-                Paragraph::new(format!(" {}: ", state.mode))
+                Paragraph::new("SEARCH: ")
                     .style(Style::new().bg(Color::Black))
-                    .render(search_layout[0], buf);
+                    .render(search_layout[0], frame.buffer_mut());
+                frame.set_cursor_position(Position::new(
+                    search_layout[0].x + search_state.term.chars().count() as u16 + 8,
+                    search_layout[0].y + 1,
+                ));
 
-                let text_area = Paragraph::new(search_state.term.as_ref());
+                let text_area = Paragraph::new(search_state.term.as_ref())
+                    .style(Style::new().add_modifier(Modifier::RAPID_BLINK));
                 // text_area.move_cursor(tui_textarea::CursorMove::End);
-                text_area.render(search_layout[1], buf);
+                text_area.render(search_layout[1], frame.buffer_mut());
             }
         };
 
         Paragraph::new(selected_name)
             .style(Style::new().bg(Color::Black))
             .right_aligned()
-            .render(modeline_layout[1], buf);
+            .render(modeline_layout[1], frame.buffer_mut());
 
         if process_effects {
             let inner_table_layout = bottom_layout[0].offset(Offset { x: 0, y: 1 });
@@ -430,24 +439,28 @@ impl App {
                 .effects
                 .table_slide_in
                 .0
-                .update(buf, inner_table_layout, state.dt);
-            state
-                .effects
-                .modeline_slide_in_left
-                .0
-                .update(buf, modeline_layout[0], state.dt);
-            state
-                .effects
-                .modeline_slide_in_right
-                .0
-                .update(buf, modeline_layout[1], state.dt);
+                .update(frame.buffer_mut(), inner_table_layout, state.dt);
+            state.effects.modeline_slide_in_left.0.update(
+                frame.buffer_mut(),
+                modeline_layout[0],
+                state.dt,
+            );
+            state.effects.modeline_slide_in_right.0.update(
+                frame.buffer_mut(),
+                modeline_layout[1],
+                state.dt,
+            );
 
             let mut kill_area = inner_table_layout.offset(Offset {
                 x: 0,
                 y: (selected_idx - state.process_table_state.offset()) as i32,
             });
             kill_area.height = 1;
-            state.effects.kill_effect.0.update(buf, kill_area, state.dt);
+            state
+                .effects
+                .kill_effect
+                .0
+                .update(frame.buffer_mut(), kill_area, state.dt);
         }
     }
 }
