@@ -42,6 +42,8 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     theme: Arc<str>,
+    #[serde(default)]
+    animations: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,16 +197,25 @@ impl App {
     }
 
     pub async fn run(mut self, term: &mut DefaultTerminal) -> color_eyre::Result<()> {
+        self = self.load_themes().await?;
+        self = self.load_config().await?;
+        tracing::info!("loaded config");
+        tracing::info!(?self.themes);
+        tracing::info!(?self.config.theme);
+
         let mut state = State::default();
         let event_channel = smol::channel::unbounded();
         let shader_event_channel = smol::channel::unbounded();
         let _handle_1 = smol::spawn(self.clone().fetch_sysinfo_task(event_channel.0.clone()));
         let _handle_2 = smol::spawn(Self::input_task(event_channel.0.clone()));
         let _handle_3 = smol::spawn(Self::config_hot_reload_task(event_channel.0.clone()));
-        let _handle_4 = smol::spawn(Self::effects_task(
-            event_channel.0.clone(),
-            shader_event_channel.1,
-        ));
+        if self.config.animations {
+            smol::spawn(Self::effects_task(
+                event_channel.0.clone(),
+                shader_event_channel.1,
+            ))
+            .detach();
+        };
 
         state.effects.table_slide_in.0.start();
         state.effects.modeline_slide_in_left.0.start();
@@ -212,7 +223,7 @@ impl App {
 
         state.process_table_state.select_first();
         loop {
-            if state.effects.running() {
+            if state.effects.running() && self.config.animations {
                 shader_event_channel.0.send(()).await?;
             }
             let event = event_channel.1.recv().await?;
